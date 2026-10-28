@@ -61,6 +61,7 @@ class Connect : public FrisquetDevice {
 
         void publishMqtt();
     private:
+        void onAssociationAttempt() override { _initialReadPending = true; }
         Zone& _zone1;
         Zone& _zone2;
         Zone& _zone3;

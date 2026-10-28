@@ -5,6 +5,7 @@
 #include <math.h>
 #include "RadioSettings.h"
 #include "RadioCrc.h"
+#include "RadioTxPolicy.h"
 
 class Radio {
 
@@ -22,7 +23,7 @@ class Radio {
         int16_t transmit(byte data[], size_t len);
         size_t getPacketLength() const { return _radio.lastRxLength; }
         void onReceive(void (*func)()) { _radio.setPacketReceivedAction(func);}
-        void setSyncWord(uint8_t* syncWord, size_t len) { _radio.setSyncWord(syncWord, len); }
+        int16_t setSyncWord(uint8_t* syncWord, size_t len) { return _radio.setSyncWord(syncWord, len); }
 
     private:
         int16_t finishReceive(int16_t result, const char* operation, const uint8_t* data, size_t requestedLength);
@@ -49,5 +50,8 @@ class Radio {
 #endif
         };
         PacketRadio _radio;
+        RadioTxPolicy _txPolicy;
+        // No runtime override: HP FEM + antenna ERP mapping remains unqualified.
+        bool _txReady = false;
         float _lastPacketRSSI = NAN;
 };

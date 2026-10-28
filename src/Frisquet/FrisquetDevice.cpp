@@ -2,73 +2,65 @@
 #include "../Buffer.h"
 
 bool FrisquetDevice::associer(NetworkID& networkId, uint8_t& idAssociation) {
-
+    onAssociationAttempt();
+    const NetworkID previousNetwork = radio().getNetworkID();
+    const bool previousInterrupt = FrisquetRadio::interruptReceive;
+    FrisquetRadio::interruptReceive = true;
     byte buff[RADIOLIB_SX126X_MAX_PACKET_LENGTH];
     size_t buffLength = 0;
     int16_t err;
     
-    radio().setNetworkID({0xFF, 0xFF, 0xFF, 0xFF}); // Broadcast
-
-    uint8_t retry = 0;
-    unsigned long timeout = millis() + 30000;
-    do {
+    const bool listening = radio().setNetworkID({0xFF, 0xFF, 0xFF, 0xFF}) == RADIOLIB_ERR_NONE;
+    const uint32_t started = millis();
+    bool sent = false;
+    NetworkID candidate;
+    uint8_t candidateAssociation = 0xFF;
+    while (listening && uint32_t(millis() - started) < 30000U) {
         err = radio().receive(buff, 0);
         if(err != RADIOLIB_ERR_NONE) {
             continue;
         }
 
         buffLength = radio().getPacketLength(); 
-        if (buffLength != 11) {
+        if (uint32_t(millis() - started) >= 30000U
+            || !FrisquetRadio::readAssociation(buff, buffLength, getId(), candidate, candidateAssociation)) {
             continue;
         }
 
+        logRadio(true, (byte*)buff, buffLength);
+        FrisquetRadio::RadioTrameHeader header;
+        memcpy(&header, buff, sizeof(header));
         struct {
             FrisquetRadio::RadioTrameHeader header;
-            uint8_t length;
             NetworkID networkID;
-        } donnees;
-
-        logRadio(true, (byte*)buff, buffLength);
-
-        ReadBuffer readBuffer = ReadBuffer(buff, buffLength);
-        readBuffer.getBytes((byte*)&donnees, sizeof(donnees));
-
-        if(donnees.header.idExpediteur == ID_CHAUDIERE && donnees.header.type == FrisquetRadio::MessageType::ASSOCIATION) {
-            info("[DEVICE] Réception trame d'association");
-
-            struct {
-                FrisquetRadio::RadioTrameHeader header;
-                NetworkID networkID;
-            } confirmPayload;
-            
-            donnees.header.answer(confirmPayload.header);
-            confirmPayload.header.idExpediteur = this->getId();
-            confirmPayload.networkID = donnees.networkID;
-
-            info("[DEVICE] Récupération du NetworkID : %s.", byteArrayToHexString((byte*)&donnees.networkID, sizeof(NetworkID)).c_str());
-            info("[DEVICE] Récupération de l'association ID : %s.", byteArrayToHexString((byte*)&donnees.header.idAssociation, 1).c_str());
-
-            logRadio(false, (byte*)&confirmPayload, sizeof(confirmPayload));
-
-            for(uint8_t i = 0; i < 10; i++) {
-                err = radio().transmit((byte*)&confirmPayload, sizeof(confirmPayload));
-                if (err != RADIOLIB_ERR_NONE) {
-                    continue;
-                }
-                delay(30);
-            }
-
-            idAssociation = donnees.header.idAssociation;
-            networkId = confirmPayload.networkID;
-            
-            radio().setNetworkID(networkId);
-
-            delay(5000); // Attente 5 secondes
-            return true;
+        } confirmPayload;
+        header.answer(confirmPayload.header);
+        confirmPayload.header.idExpediteur = getId();
+        confirmPayload.networkID = candidate;
+        logRadio(false, (byte*)&confirmPayload, sizeof(confirmPayload));
+        for(uint8_t i = 0; i < 10; i++) {
+            err = radio().transmit((byte*)&confirmPayload, sizeof(confirmPayload));
+            if (err == RADIOLIB_ERR_NONE) sent = true;
+            if (err == RadioTxPolicy::INHIBITED || err == RadioTxPolicy::AIRTIME_LIMIT) break;
+            delay(30);
         }
-    } while(millis() < timeout);
-
-    return false;
+        break;
+    }
+    const bool configured = sent && radio().setNetworkID(candidate) == RADIOLIB_ERR_NONE;
+    if (!configured) radio().setNetworkID(previousNetwork);
+    FrisquetRadio::receivedFlag = false;
+    const int16_t receiveResult = radio().startReceive();
+    FrisquetRadio::interruptReceive = previousInterrupt;
+    if (!configured || receiveResult != RADIOLIB_ERR_NONE) {
+        radio().setNetworkID(previousNetwork);
+        radio().startReceive();
+        return false;
+    }
+    networkId = candidate;
+    idAssociation = candidateAssociation;
+    info("[DEVICE] Confirmation émise localement; réponse chaudière ultérieure non vérifiée.");
+    delay(5000); // Preserve the protocol settling interval, not a boiler ACK.
+    return true;
 }
 
 bool FrisquetDevice::recupererDate() {
@@ -87,7 +79,7 @@ bool FrisquetDevice::recupererDate() {
 
     uint8_t retry = 0;
     do {
-        length = 0;
+        length = sizeof(donnees);
         err = this->radio().sendAsk(
             this->getId(), 
             ID_CHAUDIERE, 

@@ -75,7 +75,8 @@ class FrisquetRadio : public Radio {
         byte* donneesEnvoi, 
         uint8_t longueurDonnees,
         byte* donneesReception, 
-        size_t& length
+        size_t& length,
+        uint8_t attempts = 6
     );
 
     int16_t sendAnswer(
@@ -103,7 +104,10 @@ class FrisquetRadio : public Radio {
             bool keepReceiving = false // L'écoute continue est déjà armée par le manager.
         );
 
-    void setNetworkID(NetworkID networkID);
+    int16_t setNetworkID(NetworkID networkID);
+    NetworkID getNetworkID() const { return _networkID; }
+    static bool readAssociation(const byte* data, size_t length, uint8_t device,
+                                NetworkID& network, uint8_t& association);
 
     bool popBufferedPacket(byte* donnees, size_t& length, float* rssi = nullptr);
     bool hasBufferedPacket();
@@ -123,4 +127,5 @@ class FrisquetRadio : public Radio {
     void purgeBufferedPackets();
     bool bufferUnexpectedPacket(const byte* donnees, size_t length);
     BufferedPacket _rxBuffer[RX_BUFFER_SIZE];
+    NetworkID _networkID;
 };

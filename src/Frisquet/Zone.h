@@ -5,6 +5,7 @@
 #include "../Logs.h"
 #include "FrisquetDevice.h"
 #include "Preferences.h"
+#include "../ControlLease.h"
 
 class Zone {
     public:
@@ -56,6 +57,8 @@ class Zone {
         void loadConfig();
         void saveConfig();
         void publishMqtt();
+        bool controlCurrent();
+        void resetControl() { _controlLease.reset(); }
 
 
         uint8_t getNumeroZone();
@@ -125,6 +128,10 @@ class Zone {
         bool programmationRecue() const { return _programmationRecue; }
 
     private:
+        void synchronizeControlSession();
+        void markControl(ControlLease::Field field);
+        ControlLease _controlLease;
+        uint32_t _controlGeneration = 0;
         bool programmeLocal() const { return _source != SOURCE::CONNECT; }
         bool programmeDisponible() const;
         bool regimeProgramme(bool& confort, uint32_t* prochaineTransition = nullptr) const;

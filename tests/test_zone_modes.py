@@ -69,6 +69,7 @@ struct MqttDevice {String baseTopic="frisquet";};
 struct MqttManager {
     MqttDevice device;unsigned discoveries=0;
     bool connected(){return true;}
+    uint32_t connectionGeneration(){return 1;}
     void publishState(MqttEntity& entity,const String& value){entity.value=value;}
     void publishAvailability(MqttEntity&,bool){}
     void registerEntity(MqttDevice&,MqttEntity&,bool){++discoveries;}
@@ -103,11 +104,12 @@ methods = [
     'void Zone::actualiserConsigne(', 
     'bool Zone::appliquerPreset(', 'bool Zone::appliquerConsigne(', 'void Zone::loop(', 'void Zone::confirmerMode(MODE_ZONE',
     'void Zone::publierMode(', 'void Zone::actualiserDecouverte(',
+    'void Zone::synchronizeControlSession(',
 ]
 for name in ['Confort','Reduit','HorsGel','Consigne','Boost']:
     methods += [f'void Zone::setTemperature{name}(', f'float Zone::getTemperature{name}(']
 helpers = source[source.index('namespace {\nString nomPreset'):source.index('void Zone::loadConfig()')]
-code = prefix + '\n#include "Frisquet/ZoneProgram.h"\n' + class_code + '\n' + helpers
+code = prefix + '\n#include "Frisquet/ZoneProgram.h"\n#include "ControlLease.h"\n' + class_code + '\n' + helpers
 code += '\n'.join(extract(method) for method in methods)
 code += r'''
 struct Config {

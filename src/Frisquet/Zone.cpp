@@ -2,6 +2,7 @@
 #include "ZoneProgram.h"
 #include <TimeLib.h>
 #include <stdlib.h>
+#include "../NumericPayload.h"
 
 namespace {
 String nomPreset(Zone::MODE_ZONE mode, byte options) {
@@ -23,6 +24,7 @@ String nomRegime(Zone::MODE_ZONE mode, byte options) {
 }
 
 void Zone::loadConfig() {
+    resetControl(); // Never re-date restored NVS values as current control data.
     bool checkMigration = false;
 
     _preferences.begin("zoneCfg" + getNumeroZone(), false);
@@ -89,7 +91,7 @@ void Zone::begin() {
     _mqttEntities.mode.setRaw("options", R"(["Auto","Dérogation Confort","Dérogation Réduit","Confort","Réduit","Hors Gel","Boost"])");
     mqtt().registerEntity(*device, _mqttEntities.mode, true);
     mqtt().onCommand(_mqttEntities.mode, [&](const String& payload){
-        appliquerPreset(payload);
+        if (appliquerPreset(payload)) markControl(ControlLease::MODE);
     });
 
     // SENSOR: Température ambiante
@@ -108,10 +110,12 @@ void Zone::begin() {
         _mqttEntities.temperatureAmbiante.set("step", "0.1");
         _mqttEntities.temperatureAmbiante.commandTopic = MqttTopic(MqttManager::compose({device->baseTopic, "z" + String(getNumeroZone()),"temperatureAmbiante", "set"}), 0, true);
         mqtt().onCommand(_mqttEntities.temperatureAmbiante, [&](const String& payload) {
-            float temperature = payload.toFloat();
-            if(!isnan(temperature)) {
+            float temperature;
+            if(NumericPayload::parse(payload.c_str(), payload.length(), 0, 50, temperature)) {
                 info("[ZONE Z%d] Modification de la température ambiante à %0.2f.", getNumeroZone(), temperature);
                 setTemperatureAmbiante(temperature);
+                markControl(ControlLease::AMBIENT);
+                refreshLastChange();
                 mqtt().publishState(_mqttEntities.temperatureAmbiante, getTemperatureAmbiante());
                 saveConfig();
             }
@@ -129,9 +133,9 @@ void Zone::begin() {
     _mqttEntities.temperatureConsigne.set("unit_of_measurement", "°C");
     _mqttEntities.temperatureConsigne.commandTopic = MqttTopic(MqttManager::compose({device->baseTopic, "z" + String(getNumeroZone()), "temperatureConsigne", "set"}), 0, false);
     mqtt().onCommand(_mqttEntities.temperatureConsigne, [this](const String& payload) {
-        char* end = nullptr;
-        const float temperature = strtof(payload.c_str(), &end);
-        if(end != payload.c_str() && *end == '\0') appliquerConsigne(temperature);
+        float temperature;
+        if (NumericPayload::parse(payload.c_str(), payload.length(), 5, 30, temperature)
+            && appliquerConsigne(temperature)) markControl(ControlLease::TARGET);
     });
     mqtt().registerEntity(*device, _mqttEntities.temperatureConsigne, true);
 
@@ -151,8 +155,8 @@ void Zone::begin() {
     mqtt().registerEntity(*device, _mqttEntities.temperatureConfort, true);
     mqtt().onCommand(_mqttEntities.temperatureConfort, [&](const String& payload) {
         if(!pilotageDisponible()) return;
-        float temperature = payload.toFloat();
-        if(!isnan(temperature)) {
+        float temperature;
+        if(NumericPayload::parse(payload.c_str(), payload.length(), 5, 30, temperature)) {
             info("[ZONE %d] Modification de la température confort à %0.2f.", getNumeroZone(), temperature);
             setTemperatureConfort(temperature);
             actualiserConsigne();
@@ -178,8 +182,8 @@ void Zone::begin() {
     mqtt().registerEntity(*device, _mqttEntities.temperatureReduit, true);
     mqtt().onCommand(_mqttEntities.temperatureReduit, [&](const String& payload) {
         if(!pilotageDisponible()) return;
-        float temperature = payload.toFloat();
-        if(!isnan(temperature)) {
+        float temperature;
+        if(NumericPayload::parse(payload.c_str(), payload.length(), 5, 30, temperature)) {
             info("[ZONE %d] Modification de la température réduit à %0.2f.", getNumeroZone(), temperature);
             setTemperatureReduit(temperature);
             actualiserConsigne();
@@ -205,8 +209,8 @@ void Zone::begin() {
     mqtt().registerEntity(*device, _mqttEntities.temperatureHorsGel, true);
     mqtt().onCommand(_mqttEntities.temperatureHorsGel, [&](const String& payload) {
         if(!pilotageDisponible()) return;
-        float temperature = payload.toFloat();
-        if(!isnan(temperature)) {
+        float temperature;
+        if(NumericPayload::parse(payload.c_str(), payload.length(), 5, 30, temperature)) {
             info("[ZONE %d] Modification de la température hors-gel à %0.2f.", getNumeroZone(), temperature);
             setTemperatureHorsGel(temperature);
             actualiserConsigne();
@@ -252,8 +256,8 @@ void Zone::begin() {
     mqtt().registerEntity(*device, _mqttEntities.temperatureBoost, true);
     mqtt().onCommand(_mqttEntities.temperatureBoost, [&](const String& payload) {
         if(!pilotageDisponible()) return;
-        float temperature = payload.toFloat();
-        if(!isnan(temperature)) {
+        float temperature;
+        if(NumericPayload::parse(payload.c_str(), payload.length(), 0.5f, 5, temperature)) {
             info("[ZONE %d] Modification de la température de boost à %0.2f.", getNumeroZone(), temperature);
             setTemperatureBoost(temperature);
             actualiserConsigne();
@@ -319,6 +323,19 @@ void Zone::begin() {
         else if(payload == "heat" && getMode() == MODE_ZONE::AUTO) appliquerPreset("Confort");
         else if(payload == "heat" && getMode() == MODE_ZONE::INCONNU) appliquerPreset("Confort");
     });
+    if (getSource() == SOURCE::SATELLITE_VIRTUEL) {
+        const MqttTopic heartbeat(MqttManager::compose({device->baseTopic, "z" + String(getNumeroZone()), "controlHeartbeat", "set"}));
+        mqtt().onCommand(heartbeat, [this](const String& payload) {
+            synchronizeControlSession();
+            const String session = mqtt().controlSession();
+            const size_t n = session.length();
+            uint64_t sequence;
+            if (mqtt().connected() && n && payload.length() > n + 1
+                && !memcmp(payload.c_str(), session.c_str(), n) && payload[n] == ':'
+                && NumericPayload::unsignedInteger(payload.c_str() + n + 1, payload.length() - n - 1, sequence))
+                _controlLease.renew(sequence, millis());
+        });
+    }
     _mqttEntities.regime.id = "regimeActifZ" + String(getNumeroZone());
     _mqttEntities.regime.name = "Régime actif Z" + String(getNumeroZone());
     _mqttEntities.regime.component = "sensor";
@@ -649,6 +666,7 @@ bool Zone::appliquerPreset(const String& preset) {
 }
 
 void Zone::loop() {
+    synchronizeControlSession();
     const bool connecte = mqtt().connected();
     if(connecte && !_mqttConnecte) publishMqtt();
     _mqttConnecte = connecte;
@@ -666,6 +684,26 @@ void Zone::loop() {
     refreshLastChange();
     saveConfig();
     publishMqtt();
+}
+
+void Zone::synchronizeControlSession() {
+    const uint32_t generation = mqtt().connectionGeneration();
+    if (generation != _controlGeneration) {
+        _controlLease = ControlLease();
+        _controlGeneration = generation;
+    }
+    if (!mqtt().connected()) resetControl();
+}
+
+void Zone::markControl(ControlLease::Field field) {
+    synchronizeControlSession();
+    if (getSource() == SOURCE::SATELLITE_VIRTUEL && mqtt().connected())
+        _controlLease.mark(field, millis());
+}
+
+bool Zone::controlCurrent() {
+    synchronizeControlSession();
+    return mqtt().connected() && _controlLease.current(millis());
 }
 
 void Zone::confirmerMode(MODE_ZONE mode, byte options) {

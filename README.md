@@ -1,5 +1,71 @@
 # 🧠 OpenFrisquetVisio
 
+## Candidat de préparation V4.3 — émission interdite
+
+Ce candidat local n'est pas une mise en service. Toutes les émissions passent
+par `Radio::transmit`, qui reste inhibé sans chemin d'activation : la relation
+SX1262 → FEM KCT8103L → antenne/ERP n'est pas qualifiée. La consigne explicite
+−9 dBm est celle de la puce, PAS une puissance à l'antenne. Aucun essai radio
+ou thermique, aucune conformité RF mesurée n'est revendiquée.
+
+Le garde global réserve avant chaque tentative (y compris association/retries)
+au plus 3,6 s par heure glissante, via 61 tranches d'une minute. Il surcompte
+le timeout RadioLib (5 ms + 5× temps nominal, arrondi conservateur) et impose
+une heure sans TX après boot pour couvrir le budget antérieur inconnu.
+Ce silence réglementaire peut empêcher un ordre de sécurité après reboot :
+une garantie physique de coupure de chauffe n'est donc PAS livrée par ce build.
+
+Contrôle virtuel, sans changer les topics scalaires existants :
+
+1. Le producteur lit `<baseTopic>/controlSession`, défi renouvelé à chaque
+   connexion MQTT. Le défi n'est ni une identité ni une autorisation.
+2. Toutes les 60 s, il recalcule les données courantes et publie sans retain
+   `z1/mode/set`, `z1/temperatureConsigne/set`, `z1/temperatureAmbiante/set`
+   (ordre libre), puis `z1/controlHeartbeat/set` = `<défi>:<séquence uint64>`.
+   La séquence doit croître strictement dans cette session. Chaque heartbeat
+   exige les trois commandes valides reçues depuis le heartbeat précédent,
+   chacune âgée d'au plus 60 s. Les profils seuls ne qualifient rien.
+3. Le bail expire exactement à 1 800 000 ms depuis le dernier heartbeat accepté,
+   indépendamment des mises à jour scalaires suivantes et de l'horloge civile.
+   Boot/restauration NVS, perte MQTT/Wi-Fi, reconnexion et tentative de réassociation
+   désarment le contrôle ; il faut de nouvelles données et un nouveau heartbeat.
+   Les temps d'origine de réception ne sont jamais restaurés comme « maintenant ».
+   Ce protocole atteste un producteur actif ; il ne mesure pas l'âge physique
+   du capteur, que le producteur doit qualifier avant de publier.
+
+Sans bail valide, ou si la chaudière déclare l'arrêt chauffage, le payload est
+fixé à consigne 5 °C / ambiance de contrôle 30 °C / mode Hors Gel (erreur −25 °C).
+Ce n'est pas une température ambiante mesurée ni le secours NAS à 20 °C.
+Le sens réel du mode et la réaction chaudière restent à vérifier physiquement.
+La boucle tente ce sens non-chauffant, pas seulement l'arrêt des transmissions.
+L'inhibition RF prime TOUJOURS, même sur ce payload.
+
+Une lecture pure A029 complète et correspondant à l'association précède toute
+commande chauffante. Si elle échoue, elle reste en attente et seule la direction
+non-chauffante est tentée ; elle peut avoir modifié l'état avant une lecture
+ultérieure. `z1/boilerObserved` expose ambiance, consigne, mode BRUT, âge et
+`beforeWriteAttempt` pour ne pas présenter une telle lecture comme l'état initial.
+Il ne télécharge PAS les trois presets Confort/Réduit/Hors Gel ou le programme,
+et ne modifie ni la Zone désirée ni le mode de compatibilité Connect.
+`z1/controlSafety` distingue le contrôle courant de la direction de sécurité,
+en rappelant que RF reste inhibé. Les états scalaires historiques restent désirés,
+pas des reçus radio/thermiques.
+
+L'association ne réussit localement que si une confirmation est émise ; son
+retour HTTP précise `boilerResponseVerified=false`. Aucun ACK final chaudière
+inexistant n'est inventé. L'échec restaure le réseau RX précédent, sans persister
+de nouveaux identifiants. Une réassociation réarme lecture et qualification.
+
+Avant installation/émission : revue indépendante de ce head, mapping de puissance
+HP/antenne et budget RF effectif, producteur adoptant le protocole ci-dessus,
+retour au satellite physique et interprétation non-chauffante qualifiés, ainsi
+que préconditions hydrauliques. Le writer HA existant n'est pas migré par ce
+correctif. Pas de nouveau contrôleur, horaires copiés, activation Connect ou ECS.
+
+Vérifications logicielles : `python3 tests/test_commissioning.py`, les autres
+`tests/test_*.py`, et `node --test tests/*.test.mjs`. Les doubles ne prouvent
+ni réception RF ni effet thermique.
+
 Emulation complète du module **Frisquet Connect**, **sonde Extérieure** ou encore **satellite d'ambiance** sur base **Heltec ESP32 WiFi LoRa 32 (SX1262)** ou **LilyGo/TTGO LoRa32 V2.1 (SX1276, 868 MHz)**.
 Ce projet permet à un ESP32 de dialoguer directement avec votre chaudière Frisquet,  
 de récupérer les informations en temps réel et de les exposer à **Home Assistant via MQTT**.

@@ -31,6 +31,7 @@ class FrisquetDevice {
         bool associer(NetworkID& networkId, uint8_t& idAssociation);
 
     protected:
+        virtual void onAssociationAttempt() {}
         FrisquetDevice(FrisquetRadio& radio, Config& cfg, MqttManager& mqtt, uint8_t idAppareil, uint8_t idAssociation = 0xFF) : _radio(radio), _mqtt(mqtt), _cfg(cfg), _idAppareil(idAppareil), _idAssociation(idAssociation) {}
         FrisquetRadio& getRadio() { return _radio; }
 

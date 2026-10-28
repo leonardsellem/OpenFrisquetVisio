@@ -30,6 +30,8 @@ code = r'''
 #include <assert.h>
 #include <stdio.h>
 #include "RadioCrc.h"
+#include "RadioTxPolicy.h"
+uint32_t millis(){return RadioTxPolicy::HOUR_MS;}
 using RadioLibTime_t=uint32_t;
 using byte=uint8_t;
 #define RADIO_SX1276
@@ -89,6 +91,8 @@ class Radio {public:
         int16_t readData(uint8_t*,size_t) override;
     };
     PacketRadio _radio;
+    RadioTxPolicy _txPolicy;
+    bool _txReady=true; // Simulated power qualification; artifact has no enabling path.
     bool hasReceivedPacket();
     int16_t transmit(byte*,size_t);
 };

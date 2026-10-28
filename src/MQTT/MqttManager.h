@@ -5,6 +5,7 @@
 #include <vector>
 #include <map>
 #include <functional>
+#include <esp_system.h>
 #include "MqttDevice.h"
 
 class MqttManager {
@@ -27,7 +28,7 @@ public:
     _mqtt.setClient(_client);
     _mqtt.setServer(_opts.host.c_str(), _opts.port);
     _mqtt.setKeepAlive(_opts.keepAliveSec);
-    _mqtt.setSocketTimeout(15);
+    _mqtt.setSocketTimeout(1); // Bound broker silence before the local safety loop.
     _mqtt.setBufferSize(_bufferSize);
 
     _mqtt.setCallback([this](char* topic, uint8_t* payload, unsigned int len) {
@@ -40,6 +41,8 @@ public:
 
   bool loop() { if (!_mqtt.connected()) reconnect(); return _mqtt.loop(); }
   bool connected() { return _mqtt.connected(); }
+  uint32_t connectionGeneration() const { return _connectionGeneration; }
+  String controlSession() const { return _controlSession; }
 
   // --- Device & Entity registration ---
 
@@ -146,6 +149,8 @@ private:
   PubSubClient _mqtt;
   Options _opts;
   const size_t _bufferSize = 4096;
+  uint32_t _connectionGeneration = 0;
+  String _controlSession;
 
   std::map<String, MqttDevice*> _devices;
   std::vector<String> _removedDiscoveryTopics;
@@ -162,6 +167,12 @@ private:
                       _opts.username.length()? _opts.username.c_str(): nullptr,
                       _opts.password.length()? _opts.password.c_str(): nullptr,
                       nullptr, 0, false, nullptr, _opts.cleanSession)) {
+      ++_connectionGeneration;
+      char session[17];
+      snprintf(session, sizeof(session), "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
+      _controlSession = session;
+      // Fresh connection challenge, not a persisted authority/lease.
+      publishRaw(compose({_opts.baseTopic, "controlSession"}), _controlSession, 0, true);
 
       // Birth de chaque device + (re)publication des discovery + resubscribe
       for (auto i : _devices) {

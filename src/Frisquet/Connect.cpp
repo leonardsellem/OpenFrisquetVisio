@@ -385,7 +385,7 @@ bool Connect::recupererModeECS() {
 
     uint8_t retry = 0;
     do {
-        //length = sizeof(buff);
+        length = sizeof(buff);
         err = this->radio().sendAsk(
             this->getId(), 
             ID_CHAUDIERE, 
@@ -398,7 +398,8 @@ bool Connect::recupererModeECS() {
             length
         );
 
-        if(err != RADIOLIB_ERR_NONE) {
+        if(err != RADIOLIB_ERR_NONE || length != sizeof(buff)
+           || buff.longueurDonnees != sizeof(buff) - sizeof(buff.header) - 1) {
             delay(10);
             continue;
         }

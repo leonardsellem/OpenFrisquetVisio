@@ -243,45 +243,35 @@ void FrisquetManager::onRadioReceive()
 
 bool FrisquetManager::recupererNetworkID() {
     byte buff[RADIOLIB_SX126X_MAX_PACKET_LENGTH];
-    size_t buffLength = 0;
-    int16_t err;
-    
-    radio().setNetworkID({0xFF, 0xFF, 0xFF, 0xFF}); // Broadcast
-
-    uint8_t retry = 0;
-    unsigned long timeout = millis() + 30000;
-    do {
-        err = radio().receive(buff, 0);
-        if(err != RADIOLIB_ERR_NONE) {
-            continue;
-        }
-
-        buffLength = radio().getPacketLength(); 
-        if (buffLength != 11) {
-            continue;
-        }
-
-        struct {
-            FrisquetRadio::RadioTrameHeader header;
-            uint8_t length;
-            NetworkID networkID;
-        } donnees;
-
-        logRadio(true, (byte*)buff, buffLength, radio().getLastPacketRSSI());
-
-        ReadBuffer readBuffer = ReadBuffer(buff, buffLength);
-        readBuffer.getBytes((byte*)&donnees, sizeof(donnees));
-
-        if(donnees.header.idExpediteur == ID_CHAUDIERE && donnees.header.type == FrisquetRadio::MessageType::ASSOCIATION) {
-            info("[DEVICE] Réception trame d'association");
-            info("[DEVICE] Récupération du NetworkID : %s.", byteArrayToHexString((byte*)&donnees.networkID, sizeof(NetworkID)).c_str());
-            
-            config().setNetworkID(donnees.networkID);
-            radio().setNetworkID(donnees.networkID);
-            config().save();
-            return true;
-        }
-    } while(millis() < timeout);
-
-    return false;
+    const NetworkID previous = radio().getNetworkID();
+    const bool previousInterrupt = FrisquetRadio::interruptReceive;
+    FrisquetRadio::interruptReceive = true;
+    const bool listening = radio().setNetworkID({0xFF, 0xFF, 0xFF, 0xFF}) == RADIOLIB_ERR_NONE;
+    const uint32_t started = millis();
+    NetworkID candidate;
+    bool found = false;
+    while (listening && uint32_t(millis() - started) < 30000U) {
+        if (radio().receive(buff, 0) != RADIOLIB_ERR_NONE) continue;
+        const size_t length = radio().getPacketLength();
+        if (uint32_t(millis() - started) >= 30000U || length < 1) continue;
+        const uint8_t device = buff[0];
+        if (device != ID_ZONE_1 && device != ID_ZONE_2 && device != ID_ZONE_3
+            && device != ID_CONNECT && device != ID_SONDE_EXTERIEURE) continue;
+        uint8_t association;
+        if (!FrisquetRadio::readAssociation(buff, length, device, candidate, association)) continue;
+        found = radio().setNetworkID(candidate) == RADIOLIB_ERR_NONE;
+        break;
+    }
+    if (!found) radio().setNetworkID(previous);
+    FrisquetRadio::receivedFlag = false;
+    const int16_t receiveResult = radio().startReceive();
+    FrisquetRadio::interruptReceive = previousInterrupt;
+    if (!found || receiveResult != RADIOLIB_ERR_NONE) {
+        radio().setNetworkID(previous);
+        radio().startReceive();
+        return false;
+    }
+    config().setNetworkID(candidate);
+    config().save();
+    return true;
 }

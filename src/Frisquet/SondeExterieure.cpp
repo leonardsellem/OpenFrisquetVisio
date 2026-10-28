@@ -1,5 +1,6 @@
 #include "SondeExterieure.h"
 #include <math.h>
+#include "../NumericPayload.h"
 
 void SondeExterieure::loadConfig() {
     bool checkMigration = false;
@@ -116,10 +117,10 @@ void SondeExterieure::begin() {
     _mqttEntities.tempExterieure.set("mode", "box");
     _mqttEntities.tempExterieure.set("step", "0.1");
     mqtt().onCommand(_mqttEntities.tempExterieure, [&](const String& payload) {
-            float temperature = payload.toFloat();
-            if(!isnan(temperature)) {
+            float temperature;
+            if(NumericPayload::parse(payload.c_str(), payload.length(), -30, 80, temperature)) {
                 info("[SONDE EXTERIEURE] Modification manuelle de la température extérieure à %0.2f.", temperature);
-                setTemperatureExterieure(payload.toFloat());
+                setTemperatureExterieure(temperature);
                 mqtt().publishState(_mqttEntities.tempExterieure, getTemperatureExterieure());
             }
         });

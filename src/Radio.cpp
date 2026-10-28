@@ -154,9 +154,9 @@ int16_t Radio::PacketRadio::readData(uint8_t* data, size_t len) {
 #endif
 
 int16_t Radio::transmit(byte data[], size_t len) {
-#if defined(RADIO_SX1276)
-    if(len > MAX_RX_PACKET_LENGTH) return RADIOLIB_ERR_PACKET_TOO_LONG;
-#endif
+    if(len == 0 || len > MAX_RX_PACKET_LENGTH) return RADIOLIB_ERR_PACKET_TOO_LONG;
+    if (!_txReady) return RadioTxPolicy::INHIBITED;
+    if (!_txPolicy.reserve(millis(), len)) return RadioTxPolicy::AIRTIME_LIMIT;
     // Restaurer le format sur l'air : longueur variable et CRC matériel.
     int16_t result = _radio.standby();
     if (result != RADIOLIB_ERR_NONE) return result;
@@ -252,6 +252,8 @@ constexpr uint8_t KCT8103L_CTX_PIN = GPIO_NUM_5;
 Radio::Radio() : _radio(new Module(RADIO_NSS, RADIO_IRQ, RADIO_RST, RADIO_GPIO)) {}
 
 void Radio::init(float rxBandwidth, bool lnaBypass) {
+    _txReady = false;
+    _txPolicy.reset(millis());
 #if defined(RADIO_SX1276)
     SPI.begin(RADIO_SCK, RADIO_MISO, RADIO_MOSI, RADIO_NSS);
 #endif
@@ -283,7 +285,9 @@ void Radio::init(float rxBandwidth, bool lnaBypass) {
     info("[RADIO] KCT8103L : bypass du LNA %s en réception.", lnaBypass ? "activé" : "désactivé");
 #endif
 
-    const int16_t initResult = _radio.beginFSK();
+    if (!RadioSettings::validRxBandwidth(rxBandwidth)) rxBandwidth = RadioSettings::DEFAULT_RX_BANDWIDTH;
+    const int16_t initResult = _radio.beginFSK(868.96f, 25.0f, 50.0f, rxBandwidth,
+                                             RadioTxPolicy::CHIP_POWER_DBM, 16);
     if(initResult != RADIOLIB_ERR_NONE) {
         error("[RADIO] Échec initialisation FSK : %d", initResult);
         return;
@@ -291,7 +295,6 @@ void Radio::init(float rxBandwidth, bool lnaBypass) {
     _radio.setFrequency(868.96);
     _radio.setBitRate(25.0);
     _radio.setFrequencyDeviation(50.0);
-    if (!RadioSettings::validRxBandwidth(rxBandwidth)) rxBandwidth = RadioSettings::DEFAULT_RX_BANDWIDTH;
     const int16_t bandwidthResult = _radio.setRxBandwidth(rxBandwidth);
     if (bandwidthResult != RADIOLIB_ERR_NONE) {
         error("[RADIO] Échec configuration bande RX %.1f kHz : %d", rxBandwidth, bandwidthResult);
@@ -299,6 +302,7 @@ void Radio::init(float rxBandwidth, bool lnaBypass) {
         info("[RADIO] Bande RX configurée : %.1f kHz.", rxBandwidth);
     }
     _radio.setPreambleLength(16);
+    error("[RADIO] TX INHIBITED: HP FEM/antenna ERP mapping unqualified; chip=%d dBm is NOT antenna power. Duty guard=3.6 s/hour incl retries, boot hold=1 hour.", RadioTxPolicy::CHIP_POWER_DBM);
 #if defined(RADIO_SX1276)
     info("[RADIO] SX1276 : longueur variable, %u octets max, CRC matériel CCITT.", MAX_RX_PACKET_LENGTH);
 #else

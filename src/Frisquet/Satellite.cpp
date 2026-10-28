@@ -17,12 +17,30 @@ void Satellite::saveConfig() {
 
 void Satellite::begin(bool modeVirtuel) {
     _modeVirtuel = modeVirtuel;
+    onAssociationAttempt();
     loadConfig();
 
     info("[SATELLITE Z%d] Initialisation du satellite [MODE %s].", _zone.getNumeroZone(), _modeVirtuel ? "VIRTUEL" : "PHYSIQUE");
 
     // Device commun
     MqttDevice* device = mqtt().getDevice("openFrisquetVisio");
+
+    if (_modeVirtuel && getNumeroZone() == 1) {
+        auto& observed = _mqttEntities.boilerObserved;
+        observed.id = "boilerObservedZ1";
+        observed.name = "Observation chaudière Z1 (A029)";
+        observed.component = "sensor";
+        observed.stateTopic = MqttTopic(MqttManager::compose({device->baseTopic, "z1", "boilerObserved"}), 0, false);
+        observed.set("value_template", "{{ value_json.valid }}");
+        observed.set("json_attributes_topic", observed.stateTopic.full);
+        mqtt().registerEntity(*device, observed, true);
+        auto& safety = _mqttEntities.controlSafety;
+        safety.id = "controlSafetyZ1";
+        safety.name = "Sécurité commande Z1";
+        safety.component = "sensor";
+        safety.stateTopic = MqttTopic(MqttManager::compose({device->baseTopic, "z1", "controlSafety"}), 0, false);
+        mqtt().registerEntity(*device, safety, true);
+    }
 
     // SWITCH: Activation Écrasement consigne
     _mqttEntities.ecrasementConsigne.id = "ecrasementConsigneZ" + String(getNumeroZone());
@@ -46,7 +64,7 @@ void Satellite::begin(bool modeVirtuel) {
 }
 
 void Satellite::loop() {
-    
+    updateObservationAge();
     bool& firstLoop = _initialReadPending;
     const bool cdcGereeParConnect = getConfig().useConnect();
     if(firstLoop && !_modeVirtuel) {
@@ -56,14 +74,25 @@ void Satellite::loop() {
     }
 
     uint32_t now = millis();
-
+    if (_modeVirtuel && uint32_t(now - _lastSafetyPublish) >= 60000U) {
+        publishMqtt();
+        _lastSafetyPublish = now;
+    }
     if(! estAssocie() || !_modeVirtuel) {
         return;
     }
 
     if(firstLoop) {
-        firstLoop = false;
-        recupererInfosChaudiere();
+        if (_readAttempted && uint32_t(now - _lastReadAttempt) < 60000U) return;
+        _readAttempted = true;
+        _lastReadAttempt = now;
+        if (!recupererInfosChaudiere()) {
+            // A read failure must not preserve a previous boot's heat forever.
+            // Only the fixed no-heat direction is allowed until qualification.
+            envoyerConsigne();
+            return;
+        }
+        firstLoop = false; // No heating write before a complete matching READ.
         if (this->getId() == ID_ZONE_1 && !cdcGereeParConnect) {
             if (recupererTemperatureCDC()) {
                 _lastRecuperationTemperatureCDC = millis();
@@ -92,10 +121,18 @@ void Satellite::loop() {
         delay(100);
     }
 
-    if ((_zone.getLastChange() > _zone.getLastEnvoi() && (_zone.getLastChange() + 15000) < now ) || now - _lastEnvoiConsigne >= 600000  ) { // dernier changement ou 10 minutes
+    now = millis();
+    const bool safe = !_zone.controlCurrent() || getEtatChaudiere().arretChauffage;
+    const bool due = !_consigneAttempted || safe != _lastDemandSafe
+        || _zone.getLastChange() != _zone.getLastEnvoi()
+        || uint32_t(now - _lastEnvoiConsigne) >= 600000U;
+    if (due && (!_consigneAttempted || uint32_t(now - _lastConsigneAttempt) >= 15000U)) {
         info("[SATELLITE Z%d] Envoi de la consigne.", getNumeroZone());
-        _zone.refreshLastEnvoi();
+        _consigneAttempted = true;
+        _lastConsigneAttempt = now;
         if(envoyerConsigne()) {
+            _zone.refreshLastEnvoi();
+            _lastDemandSafe = safe;
             incrementIdMessage(3);
             _lastEnvoiConsigne = now;
             _zone.publishMqtt();
@@ -108,6 +145,20 @@ void Satellite::loop() {
 }
 
 void Satellite::publishMqtt() {
+    if (_modeVirtuel && getNumeroZone() == 1) {
+        updateObservationAge();
+        char state[192];
+        if (_observedZ1.valid) {
+            snprintf(state, sizeof(state), "{\"valid\":true,\"ambient\":%.1f,\"setpoint\":%.1f,\"rawMode\":%u,\"ageMs\":%llu,\"beforeWriteAttempt\":%s}",
+                     _observedZ1.ambient, _observedZ1.setpoint, _observedZ1.rawMode,
+                     (unsigned long long)_observedZ1.ageMs, _observedZ1.beforeWrite ? "true" : "false");
+        } else {
+            snprintf(state, sizeof(state), "{\"valid\":false}");
+        }
+        mqtt().publishState(_mqttEntities.boilerObserved, state);
+        mqtt().publishState(_mqttEntities.controlSafety, !_initialReadPending && _zone.controlCurrent() && !getEtatChaudiere().arretChauffage
+                            ? "current-control; RF inhibited" : "no-heat direction; RF inhibited");
+    }
     mqtt().publishState(*mqtt().getDevice("openFrisquetVisio")->getEntity("ecrasementConsigneZ" + String(getNumeroZone())), getEcrasement() ? "ON" : "OFF");
     if(this->getId() == ID_ZONE_1) { // Seulement sur Z1 (leader)
         _chaudiere.publishMqtt();
@@ -164,11 +215,24 @@ bool Satellite::recupererInfosChaudiere() {
             length
         );
         
-        if(err != RADIOLIB_ERR_NONE) {
+        if(err != RADIOLIB_ERR_NONE || length != sizeof(donneesZones_t)
+            || donneesZones.longueur != sizeof(donneesZones_t) - sizeof(FrisquetRadio::RadioTrameHeader) - 1) {
             delay(30);
             continue;
         }
 
+        const float ambient = donneesZones.temperatureAmbianteZ1.toFloat();
+        const float setpoint = donneesZones.temperatureConsigneZ1.toFloat();
+        if (!isfinite(ambient) || ambient < 0 || ambient > 50
+            || !isfinite(setpoint) || setpoint < 5 || setpoint > 30) continue;
+        // Pure read-side truth, NOT a three-preset/program download. No Zone setter.
+        _observedZ1.valid = true;
+        _observedZ1.beforeWrite = !_writeAttempted;
+        _observedZ1.ambient = ambient;
+        _observedZ1.setpoint = setpoint;
+        _observedZ1.rawMode = donneesZones.modeZ1;
+        _observedZ1.ageMs = 0;
+        _observedZ1.tick = millis();
         setEtatChaudiere(donneesZones.etatChaudiere);
         Date date = donneesZones.date;
         setDate(date);
@@ -190,11 +254,12 @@ bool Satellite::recupererTemperatureCDC() {
         temperature16 temperatureCDC;
     } donneesTemperatureCDC;
 
-    size_t length = sizeof(donneesTemperatureCDC_t);
+    size_t length;
     int16_t err;
 
     uint8_t retry = 0;
     do {
+        length = sizeof(donneesTemperatureCDC_t);
         err = this->radio().sendAsk(
             this->getId(),
             ID_CHAUDIERE,
@@ -207,7 +272,8 @@ bool Satellite::recupererTemperatureCDC() {
             length
         );
 
-        if(err != RADIOLIB_ERR_NONE) {
+        if(err != RADIOLIB_ERR_NONE || length != sizeof(donneesTemperatureCDC_t)
+            || donneesTemperatureCDC.longueurDonnees != sizeof(temperature16)) {
             delay(30);
             continue;
         }
@@ -222,6 +288,8 @@ bool Satellite::recupererTemperatureCDC() {
 }
 
 bool Satellite::envoyerTemperatureAmbiante() {
+    // Route every virtual write through the same dead-man path.
+    if (_modeVirtuel) return envoyerConsigne();
     if(! estAssocie() || getNumeroZone() == 0) {
         return false;
     }
@@ -287,7 +355,8 @@ bool Satellite::envoyerTemperatureAmbiante() {
             length
         );
         
-        if(err != RADIOLIB_ERR_NONE) {
+        if(err != RADIOLIB_ERR_NONE || length != sizeof(donneesZones_t)
+            || donneesZones.longueur != sizeof(donneesZones_t) - sizeof(FrisquetRadio::RadioTrameHeader) - 1) {
             delay(30);
             continue;
         }
@@ -307,18 +376,8 @@ bool Satellite::envoyerConsigne() {
         return false;
     }
 
-    if(isnan(_zone.getTemperatureAmbiante()) || isnan(_zone.getTemperatureConsigne()) || _zone.getMode() == Zone::MODE_ZONE::INCONNU || _zone.getNumeroZone() == 0) {
-        error("[SATELLITE Z%d] Impossible d'envoyer la consigne, configuration incomplète.", getNumeroZone());
-        return false;
-    }
-
-    struct donneesSatellite_t {
-        temperature16 temperatureAmbiante;
-        temperature16 temperatureConsigne;
-        uint8_t i1 = 0x00; 
-        uint8_t mode = 0x00; // 0x01 Confort, 0x02 Reduit, etc.
-        fword options = (uint16_t)0x0000;
-    } payload;
+    if (_modeVirtuel && _initialReadPending && !_readAttempted) return false;
+    Demand payload;
 
     struct donneesZones_t {
         FrisquetRadio::RadioTrameHeader header;
@@ -346,45 +405,15 @@ bool Satellite::envoyerConsigne() {
     } donneesZones;
 
     
-    payload.temperatureAmbiante = _zone.getTemperatureAmbiante();
-    payload.temperatureConsigne = _zone.getTemperatureConsigne();
-    switch(_zone.getMode()) {
-        case Zone::MODE_ZONE::AUTO :
-            if(_zone.confortActif()) {
-                payload.mode =  _zone.derogationActive() ? MODE::CONFORT_DEROGATION : MODE::CONFORT_AUTO;
-            } else {
-                payload.mode =  _zone.derogationActive() ? MODE::REDUIT_DEROGATION : MODE::REDUIT_AUTO;
-            }
-            break;
-        case Zone::MODE_ZONE::CONFORT :
-            payload.mode = MODE::CONFORT_PERMANENT;
-            break;
-        case Zone::MODE_ZONE::REDUIT :
-            payload.mode = MODE::REDUIT_PERMANENT;
-            break;
-        case Zone::MODE_ZONE::HORS_GEL :
-            payload.mode = MODE::HORS_GEL;
-            break;
-        default:
-            info("[SATELLITE Z%d] Mode inconnu, impossible d'envoyer la consigne.", getNumeroZone());
-            return false;
-    }
-
-    if(getEtatChaudiere().arretChauffage) {
-        payload.mode = MODE::HORS_GEL;
-        payload.temperatureConsigne = isnan(_zone.getTemperatureHorsGel()) ? 8.0f : _zone.getTemperatureHorsGel();
-    } 
-
-    const MODE modeEnvoye = (MODE)payload.mode;
-    payload.mode = encodeModeForSend(modeEnvoye);
-    
     size_t length = 0;
     int16_t err;
 
-    info("[Satellite %d] Envoi de la consigne %0.2f, amb %0.2f, mode %s %d.", _zone.getNumeroZone(), payload.temperatureConsigne.toFloat(), _zone.getTemperatureAmbiante(), _zone.getNomMode(), payload.mode);
-    
     uint8_t retry = 0;
     do {
+        if (!prepareDemand(payload)) return false;
+        info("[Satellite %d] Wire target %.1f, ambient %.1f, raw mode 0x%02X (not thermal proof).",
+             getNumeroZone(), payload.temperatureConsigne.toFloat(), payload.temperatureAmbiante.toFloat(), payload.mode);
+        _writeAttempted = true;
         length = sizeof(donneesZones_t);
         err = this->radio().sendInit(
             this->getId(), 
@@ -399,17 +428,21 @@ bool Satellite::envoyerConsigne() {
             (byte*)&payload,
             sizeof(payload),
             (byte*)&donneesZones,
-            length
+            length,
+            _modeVirtuel ? 1 : 6 // Re-check the dead-man before any virtual retry.
         );
         
-        if(err != RADIOLIB_ERR_NONE) {
+        if(err != RADIOLIB_ERR_NONE || length != sizeof(donneesZones_t)
+            || donneesZones.longueur != sizeof(donneesZones_t) - sizeof(FrisquetRadio::RadioTrameHeader) - 1) {
             delay(30);
             continue;
         }
 
         setEtatChaudiere(donneesZones.etatChaudiere);
-        if(modeEnvoye == MODE::HORS_GEL) _zone.confirmerMode(Zone::MODE_ZONE::HORS_GEL, 0x10);
-        else _zone.confirmerMode();
+        if (!_modeVirtuel) {
+            if(getEtatChaudiere().arretChauffage) _zone.confirmerMode(Zone::MODE_ZONE::HORS_GEL, 0x10);
+            else _zone.confirmerMode();
+        }
         debug("[SATELLITE Z%d] Retour état chaudière : 0x%02X", getNumeroZone(), donneesZones.etatChaudiere);
         debug("[SATELLITE Z%d] Retour état chaudière : %s", getNumeroZone(), getEtatChaudiere().getLibelle().c_str());
         Date date = donneesZones.date;
@@ -419,6 +452,38 @@ bool Satellite::envoyerConsigne() {
     } while(retry++ < 1);
 
     return false;
+}
+
+bool Satellite::prepareDemand(Demand& payload) {
+    const bool safe = getEtatChaudiere().arretChauffage || (_modeVirtuel && (_initialReadPending || !_zone.controlCurrent()));
+    const MODE mode = safe ? MODE::HORS_GEL : getMode();
+    const float ambient = safe ? 30.0f : _zone.getTemperatureAmbiante();
+    const float target = safe ? 5.0f : _zone.getTemperatureConsigne();
+    if (mode == MODE::INCONNU || !isfinite(ambient) || ambient < 0 || ambient > 50
+        || !isfinite(target) || target < 5 || target > 30) return false;
+    // Negative 25 C wire error even if the mode byte is misinterpreted.
+    // Boiler interpretation/frost behaviour remains a PHYSICAL gate.
+    payload.temperatureAmbiante = ambient;
+    payload.temperatureConsigne = target;
+    payload.mode = encodeModeForSend(mode);
+    return true;
+}
+
+void Satellite::onAssociationAttempt() {
+    _initialReadPending = true;
+    _readAttempted = false;
+    _writeAttempted = false;
+    _consigneAttempted = false;
+    _observedZ1.valid = false;
+    _modeCompatConnect = false;
+    _zone.resetControl();
+}
+
+void Satellite::updateObservationAge() {
+    if (!_observedZ1.valid) return;
+    const uint32_t tick = millis();
+    _observedZ1.ageMs += uint32_t(tick - _observedZ1.tick);
+    _observedZ1.tick = tick;
 }
 
 bool Satellite::onReceive(byte* donnees, size_t length) { 

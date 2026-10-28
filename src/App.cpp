@@ -30,8 +30,8 @@ void App::loop() {
     }
   }
   _portal->loop();
-  _mqtt.loop();
   _frisquetManager.loop();
+  _mqtt.loop(); // Service the device dead-man before a potentially blocking reconnect.
   delay(10);
 }
 

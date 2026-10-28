@@ -105,7 +105,7 @@ int16_t FrisquetRadio::sendAsk(
     size_t& length,
     uint8_t retry
 ) {
-    
+    if (retry == 0) return RADIOLIB_ERR_RX_TIMEOUT;
     struct {
         RadioTrameHeader header;
         RadioTrameAsk body;
@@ -125,15 +125,18 @@ int16_t FrisquetRadio::sendAsk(
     
     interruptReceive = true;
     uint8_t attempts = retry;
+    const size_t capacity = length;
     int16_t err;
     do {
         delay(30);
         logRadio(false, (byte*)payload, sizeof(payload));
         err = this->transmit((byte*)&payload, sizeof(payload));
         if(err != RADIOLIB_ERR_NONE) {
+            if (err == RadioTxPolicy::INHIBITED || err == RadioTxPolicy::AIRTIME_LIMIT) break;
             continue;
         }
 
+        length = capacity;
         err = this->receiveExpected(idDestinataire, idExpediteur, idAssociation, idMessage, idReception|0x80, FrisquetRadio::MessageType::READ, donneesReception, length, retry);
         if(err == RADIOLIB_ERR_NONE || err == RADIOLIB_ERR_ADDRESS_NOT_FOUND) {
             break;
@@ -158,9 +161,10 @@ int16_t FrisquetRadio::sendInit(
     byte* donneesEnvoi, 
     uint8_t longueurDonnees,
     byte* donneesReception, 
-    size_t& length
+    size_t& length,
+    uint8_t attempts
 ) {
-
+    if (attempts == 0) return RADIOLIB_ERR_RX_TIMEOUT;
     struct {
         RadioTrameHeader header;
         RadioTrameInit body;
@@ -183,22 +187,23 @@ int16_t FrisquetRadio::sendInit(
     memcpy(&payload[sizeof(trame)], donneesEnvoi, longueurDonnees);
 
     interruptReceive = true;
-    uint8_t retry = 0;
+    const size_t capacity = length;
     int16_t err;
 
     do {
         logRadio(false, (byte*)payload, sizeof(payload));
         err = this->transmit(payload, sizeof(payload));
         if(err != RADIOLIB_ERR_NONE) {
+            if (err == RadioTxPolicy::INHIBITED || err == RadioTxPolicy::AIRTIME_LIMIT) break;
             continue;
         }
-        
+        length = capacity;
         err = this->receiveExpected(idDestinataire, idExpediteur, idAssociation, idMessage, idReception|0x80, FrisquetRadio::MessageType::INIT, donneesReception, length);
         if(err == RADIOLIB_ERR_NONE) {
             break;
         }
         delay(30);
-    } while (retry++ < 5);
+    } while (--attempts > 0);
 
     interruptReceive = false;
     startReceive();
@@ -239,6 +244,7 @@ int16_t FrisquetRadio::sendAnswer(
         logRadio(false, (byte*)payload, writeBuffer.getLength());
         err = this->transmit(payload, writeBuffer.getLength());
         if(err != RADIOLIB_ERR_NONE) {
+            if (err == RadioTxPolicy::INHIBITED || err == RadioTxPolicy::AIRTIME_LIMIT) break;
             delay(10);
             continue;
         }
@@ -321,17 +327,21 @@ int16_t FrisquetRadio::receiveExpected(
         memcpy(&radioTrameHeader, buff, sizeof(radioTrameHeader));
         if( radioTrameHeader.idExpediteur == idExpediteur && 
             radioTrameHeader.idDestinataire == idDestinataire && 
+            radioTrameHeader.idAssociation == idAssociation &&
             radioTrameHeader.idMessage == idMessage &&
             radioTrameHeader.idReception ==  idReception &&
             radioTrameHeader.type ==  type
         ) {
-            if(length == 0 || len < length) {
-                length = len;   
-            }
+            if (length && len > length) { err = RADIOLIB_ERR_PACKET_TOO_LONG; break; }
+            length = len;
             memcpy(donnees, buff, length);
             break;
         } else {
-            if(radioTrameHeader.type != type && radioTrameHeader.type == 0x83) {
+            if(radioTrameHeader.type == 0x83 && radioTrameHeader.idExpediteur == idExpediteur
+               && radioTrameHeader.idDestinataire == idDestinataire
+               && radioTrameHeader.idAssociation == idAssociation
+               && radioTrameHeader.idMessage == idMessage
+               && radioTrameHeader.idReception == idReception) {
                 err = RADIOLIB_ERR_ADDRESS_NOT_FOUND;
                 break;
             }
@@ -346,6 +356,25 @@ int16_t FrisquetRadio::receiveExpected(
     return err;
 }
 
-void FrisquetRadio::setNetworkID(NetworkID networkID) {
-    this->setSyncWord(networkID.bytes, sizeof(networkID.bytes));
+int16_t FrisquetRadio::setNetworkID(NetworkID networkID) {
+    const int16_t result = this->setSyncWord(networkID.bytes, sizeof(networkID.bytes));
+    if (result == RADIOLIB_ERR_NONE) _networkID = networkID;
+    return result;
+}
+
+bool FrisquetRadio::readAssociation(const byte* data, size_t length, uint8_t device,
+                                    NetworkID& network, uint8_t& association) {
+    if (length != sizeof(RadioTrameHeader) + 1 + sizeof(NetworkID)) return false;
+    RadioTrameHeader header;
+    memcpy(&header, data, sizeof(header));
+    if (header.idExpediteur != 0x80 || header.idDestinataire != device
+        || header.type != ASSOCIATION || header.isAck() || header.idAssociation == 0xFF
+        || data[sizeof(header)] != sizeof(NetworkID)) return false;
+    NetworkID candidate;
+    memcpy(candidate.bytes, data + sizeof(header) + 1, sizeof(candidate.bytes));
+    if (candidate.isBroadcast() || !(candidate.bytes[0] | candidate.bytes[1]
+                                    | candidate.bytes[2] | candidate.bytes[3])) return false;
+    network = candidate;
+    association = header.idAssociation;
+    return true;
 }

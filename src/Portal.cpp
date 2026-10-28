@@ -1431,7 +1431,7 @@ void Portal::handlePairConnect() {
 
   if (ok) {
     _srv.send(200, "application/json; charset=utf-8",
-              "{\"ok\":true,\"msg\":\"Association Connect lancée\"}");
+              "{\"ok\":true,\"boilerResponseVerified\":false,\"msg\":\"Confirmation Connect émise localement; retour chaudière à vérifier\"}");
   } else {
     _srv.send(500, "application/json; charset=utf-8",
               "{\"ok\":false,\"err\":\"Échec lancement association Connect\"}");
@@ -1471,7 +1471,7 @@ void Portal::handlePairSondeExt() {
 
   if (ok) {
     _srv.send(200, "application/json; charset=utf-8",
-              "{\"ok\":true,\"msg\":\"Association sonde extérieure lancée\"}");
+              "{\"ok\":true,\"boilerResponseVerified\":false,\"msg\":\"Confirmation sonde émise localement; retour chaudière à vérifier\"}");
   } else {
     _srv.send(500, "application/json; charset=utf-8",
               "{\"ok\":false,\"err\":\"Échec lancement association sonde extérieure\"}");
@@ -1513,7 +1513,7 @@ void Portal::handlePairSatelliteZ1() {
 
   if (ok) {
     _srv.send(200, "application/json; charset=utf-8",
-              "{\"ok\":true,\"msg\":\"Association Satellite Z1 lancée\"}");
+              "{\"ok\":true,\"boilerResponseVerified\":false,\"msg\":\"Confirmation Z1 émise localement; retour chaudière à vérifier\"}");
   } else {
     _srv.send(500, "application/json; charset=utf-8",
               "{\"ok\":false,\"err\":\"Échec lancement association Satellite Z1\"}");
@@ -1554,7 +1554,7 @@ void Portal::handlePairSatelliteZ2() {
 
   if (ok) {
     _srv.send(200, "application/json; charset=utf-8",
-              "{\"ok\":true,\"msg\":\"Association Satellite Z2 lancée\"}");
+              "{\"ok\":true,\"boilerResponseVerified\":false,\"msg\":\"Confirmation Z2 émise localement; retour chaudière à vérifier\"}");
   } else {
     _srv.send(500, "application/json; charset=utf-8",
               "{\"ok\":false,\"err\":\"Échec lancement association Satellite Z2\"}");
@@ -1595,7 +1595,7 @@ void Portal::handlePairSatelliteZ3() {
 
   if (ok) {
     _srv.send(200, "application/json; charset=utf-8",
-              "{\"ok\":true,\"msg\":\"Association Satellite Z3 lancée\"}");
+              "{\"ok\":true,\"boilerResponseVerified\":false,\"msg\":\"Confirmation Z3 émise localement; retour chaudière à vérifier\"}");
   } else {
     _srv.send(500, "application/json; charset=utf-8",
               "{\"ok\":false,\"err\":\"Échec lancement association Satellite Z3\"}");
