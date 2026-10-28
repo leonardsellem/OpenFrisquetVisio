@@ -15,7 +15,6 @@ void App::begin() {
   initNetwork();
   initMqtt();
   initPortal();
-  initOta();
 
   _frisquetManager.begin();
 }
@@ -30,7 +29,6 @@ void App::loop() {
       info("[WIFI] AP fallback activé après délai.");
     }
   }
-  _ota.loop();
   _portal->loop();
   _mqtt.loop();
   _frisquetManager.loop();
@@ -66,8 +64,4 @@ void App::initPortal() {
   _portal->begin(/*startApFallbackIfNoWifi=*/true);
 
   info("[PORTAIL] Portail initialisé.");
-}
-
-void App::initOta() {
-  _ota.begin(_networkManager.hostname().c_str());
 }

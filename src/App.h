@@ -8,7 +8,6 @@
 #include "NetworkManager.h"
 #include "Portal.h"
 #include "Logs.h"
-#include "OTA.h"
 
 #include "Frisquet/FrisquetRadio.h"
 #include "FrisquetManager.h"
@@ -25,8 +24,7 @@ private:
   Config _cfg;
   WiFiClient _wifiClient;
   MqttManager _mqtt;
-  NetworkManager _networkManager;
-  OTA _ota;
+  NetMgr _networkManager;
 
   FrisquetManager _frisquetManager;
 
@@ -45,5 +43,4 @@ private:
   void initNetwork();
   void initMqtt();
   void initPortal();
-  void initOta();
 };

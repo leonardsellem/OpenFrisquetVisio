@@ -8,7 +8,7 @@
 
 class Config {
     private:
-        NetworkManager::Options _wifiOpts;
+        NetMgr::Options _wifiOpts;
         MqttManager::Options _mqttOpts;
         NetworkID _networkId;
 
@@ -45,7 +45,7 @@ class Config {
         bool radioLnaBypass() const { return _radioLnaBypass; }
         void radioLnaBypass(bool enabled) { _radioLnaBypass = enabled; }
 
-        NetworkManager::Options& getWiFiOptions() { return _wifiOpts; }
+        NetMgr::Options& getWiFiOptions() { return _wifiOpts; }
         MqttManager::Options& getMQTTOptions() { return _mqttOpts; }
         NetworkID& getNetworkID() { return _networkId; }
         void setNetworkID(NetworkID networkId) { _networkId = networkId; }
