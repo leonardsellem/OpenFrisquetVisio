@@ -157,6 +157,7 @@ int16_t Radio::transmit(byte data[], size_t len) {
 #if defined(RADIO_SX1276)
     if(len > MAX_RX_PACKET_LENGTH) return RADIOLIB_ERR_PACKET_TOO_LONG;
 #endif
+    if (_initResult != RADIOLIB_ERR_NONE) return _initResult;
     // Restaurer le format sur l'air : longueur variable et CRC matériel.
     int16_t result = _radio.standby();
     if (result != RADIOLIB_ERR_NONE) return result;
@@ -252,6 +253,7 @@ constexpr uint8_t KCT8103L_CTX_PIN = GPIO_NUM_5;
 Radio::Radio() : _radio(new Module(RADIO_NSS, RADIO_IRQ, RADIO_RST, RADIO_GPIO)) {}
 
 void Radio::init(float rxBandwidth, bool lnaBypass) {
+    _initResult = RADIOLIB_ERR_UNKNOWN;
 #if defined(RADIO_SX1276)
     SPI.begin(RADIO_SCK, RADIO_MISO, RADIO_MOSI, RADIO_NSS);
 #endif
@@ -283,22 +285,39 @@ void Radio::init(float rxBandwidth, bool lnaBypass) {
     info("[RADIO] KCT8103L : bypass du LNA %s en réception.", lnaBypass ? "activé" : "désactivé");
 #endif
 
-    const int16_t initResult = _radio.beginFSK();
-    if(initResult != RADIOLIB_ERR_NONE) {
-        error("[RADIO] Échec initialisation FSK : %d", initResult);
+    _initResult = _radio.beginFSK();
+    if(_initResult != RADIOLIB_ERR_NONE) {
+        error("[RADIO] Échec initialisation FSK : %d", _initResult);
         return;
     }
-    _radio.setFrequency(868.96);
-    _radio.setBitRate(25.0);
-    _radio.setFrequencyDeviation(50.0);
-    if (!RadioSettings::validRxBandwidth(rxBandwidth)) rxBandwidth = RadioSettings::DEFAULT_RX_BANDWIDTH;
-    const int16_t bandwidthResult = _radio.setRxBandwidth(rxBandwidth);
-    if (bandwidthResult != RADIOLIB_ERR_NONE) {
-        error("[RADIO] Échec configuration bande RX %.1f kHz : %d", rxBandwidth, bandwidthResult);
-    } else {
-        info("[RADIO] Bande RX configurée : %.1f kHz.", rxBandwidth);
+#if defined(WIFI_LORA_32_V4) && defined(USE_KCT8103L_PA)
+    // Minimum SX1262, mode PA par défaut du SDK Heltec (duty 0x04, hpMax 0x07).
+    // Puissance de la puce, pas une mesure de la sortie amplifiée du KCT8103L.
+    _initResult = _radio.setOutputPower(-9, false);
+    if (_initResult != RADIOLIB_ERR_NONE) {
+        error("[RADIO] Échec configuration puissance KCT8103L : %d", _initResult);
+        return;
     }
-    _radio.setPreambleLength(16);
+#endif
+    _initResult = _radio.setFrequency(868.96);
+    if (_initResult == RADIOLIB_ERR_NONE) _initResult = _radio.setBitRate(25.0);
+    if (_initResult == RADIOLIB_ERR_NONE) _initResult = _radio.setFrequencyDeviation(50.0);
+    if (_initResult != RADIOLIB_ERR_NONE) {
+        error("[RADIO] Échec configuration FSK : %d", _initResult);
+        return;
+    }
+    if (!RadioSettings::validRxBandwidth(rxBandwidth)) rxBandwidth = RadioSettings::DEFAULT_RX_BANDWIDTH;
+    _initResult = _radio.setRxBandwidth(rxBandwidth);
+    if (_initResult != RADIOLIB_ERR_NONE) {
+        error("[RADIO] Échec configuration bande RX %.1f kHz : %d", rxBandwidth, _initResult);
+        return;
+    }
+    info("[RADIO] Bande RX configurée : %.1f kHz.", rxBandwidth);
+    _initResult = _radio.setPreambleLength(16);
+    if (_initResult != RADIOLIB_ERR_NONE) {
+        error("[RADIO] Échec configuration préambule : %d", _initResult);
+        return;
+    }
 #if defined(RADIO_SX1276)
     info("[RADIO] SX1276 : longueur variable, %u octets max, CRC matériel CCITT.", MAX_RX_PACKET_LENGTH);
 #else

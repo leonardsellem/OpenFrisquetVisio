@@ -89,6 +89,7 @@ class Radio {public:
         int16_t readData(uint8_t*,size_t) override;
     };
     PacketRadio _radio;
+    int16_t _initResult=0; // This RX/TX fixture represents a successfully initialized radio.
     bool hasReceivedPacket();
     int16_t transmit(byte*,size_t);
 };

@@ -49,5 +49,6 @@ class Radio {
 #endif
         };
         PacketRadio _radio;
+        int16_t _initResult = RADIOLIB_ERR_UNKNOWN;
         float _lastPacketRSSI = NAN;
 };
