@@ -34,6 +34,7 @@ code = r'''
 uint32_t millis(){return RadioTxPolicy::HOUR_MS;}
 using RadioLibTime_t=uint32_t;
 using byte=uint8_t;
+void error(const char*,...){}
 #define RADIO_SX1276
 #define RADIOLIB_ERR_PACKET_TOO_LONG -4
 #define RADIOLIB_ERR_NONE 0
@@ -67,6 +68,7 @@ struct Module {
 class SX1276 {public:
     size_t sentLength=0;
     int16_t transmit(uint8_t*,size_t length){sentLength=length;return 0;}
+    uint32_t getTimeOnAir(size_t length){return (length+8)*320;}
     Module module;uint16_t irq=0;bool crc=false,ccitt=false,armed=false;uint8_t maximum=0;
     Module* getMod(){return &module;}
     int16_t standby(){armed=false;return 0;}
@@ -92,7 +94,8 @@ class Radio {public:
     };
     PacketRadio _radio;
     RadioTxPolicy _txPolicy;
-    bool _txReady=true; // Simulated power qualification; artifact has no enabling path.
+    bool _txReady=true; // Simulated qualification; no SX1276 profile is admitted.
+    bool persistTxBudget(){return true;} // Persistence is exercised in commissioning tests.
     bool hasReceivedPacket();
     int16_t transmit(byte*,size_t);
 };

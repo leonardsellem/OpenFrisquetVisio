@@ -65,6 +65,13 @@ int16_t Radio::PacketRadio::readData(uint8_t* data, size_t len) {
     return crcOk ? RADIOLIB_ERR_NONE : RADIOLIB_ERR_CRC_MISMATCH;
 }
 #else
+int16_t Radio::PacketRadio::finishTransmit() {
+    // Capture before RadioLib clears IRQs. A timeout is never a TX_DONE receipt.
+    const uint32_t irq = getIrqFlags();
+    txDone = (irq & RADIOLIB_SX126X_IRQ_TX_DONE) && !(irq & RADIOLIB_SX126X_IRQ_TIMEOUT);
+    return SX1262::finishTransmit();
+}
+
 int16_t Radio::PacketRadio::startReceive() {
     return startReceiveWithLimit(RADIOLIB_SX126X_RX_TIMEOUT_INF);
 }
@@ -153,10 +160,33 @@ int16_t Radio::PacketRadio::readData(uint8_t* data, size_t len) {
 
 #endif
 
+bool Radio::persistTxBudget() {
+    Preferences preferences;
+    if (!preferences.begin("ofvRfBudget", false)) return false;
+    uint32_t record[] = {_txPolicy.usedUs(), _txPolicy.usedUs() ^ 0x52464232U};
+    const bool saved = preferences.putBytes("used", record, sizeof(record)) == sizeof(record);
+    preferences.end();
+    return saved;
+}
+
+bool Radio::loadTxBudget() {
+    Preferences preferences;
+    if (!preferences.begin("ofvRfBudget", false)) return false;
+    uint32_t record[2] = {};
+    const bool valid = preferences.getBytesLength("used") == sizeof(record)
+        && preferences.getBytes("used", record, sizeof(record)) == sizeof(record)
+        && record[0] <= RadioTxPolicy::BUDGET_US && record[1] == (record[0] ^ 0x52464232U);
+    preferences.end();
+    // No trusted RTC: retain ALL recovered spend for a new conservative window.
+    // Absent/corrupt legacy ledger is UNKNOWN, not a free refilled budget.
+    _txPolicy.reset(millis(), valid ? record[0] : RadioTxPolicy::BUDGET_US);
+    return persistTxBudget();
+}
+
 int16_t Radio::transmit(byte data[], size_t len) {
     if(len == 0 || len > MAX_RX_PACKET_LENGTH) return RADIOLIB_ERR_PACKET_TOO_LONG;
     if (!_txReady) return RadioTxPolicy::INHIBITED;
-    if (!_txPolicy.reserve(millis(), len)) return RadioTxPolicy::AIRTIME_LIMIT;
+
     // Restaurer le format sur l'air : longueur variable et CRC matériel.
     int16_t result = _radio.standby();
     if (result != RADIOLIB_ERR_NONE) return result;
@@ -168,7 +198,37 @@ int16_t Radio::transmit(byte data[], size_t len) {
     if (result != RADIOLIB_ERR_NONE) return result;
     result = _radio.variablePacketLengthMode(MAX_RX_PACKET_LENGTH);
     if (result != RADIOLIB_ERR_NONE) return result;
-    return _radio.transmit(data, len);
+    // getTimeOnAir is microseconds. RadioLib omits the variable length octet.
+    const uint32_t nominalUs = _radio.getTimeOnAir(len + 1);
+    const uint32_t expectedUs = uint32_t((len + 9U) * 320U);
+    if (nominalUs + 1 < expectedUs || nominalUs > expectedUs + 1) return RadioTxPolicy::INHIBITED;
+    if (!_txPolicy.reserve(millis(), len, RadioTxPolicy::isNoHeat(data, len))) return RadioTxPolicy::AIRTIME_LIMIT;
+    // NVS commits the full ambiguous-TX bound BEFORE any packet can leave.
+    if (!persistTxBudget()) return RadioTxPolicy::INHIBITED;
+#if !defined(RADIO_SX1276)
+    _radio.txDone = false;
+#endif
+    const uint32_t started = millis();
+    result = _radio.transmit(data, len);
+    const uint32_t elapsedMs = uint32_t(millis() - started);
+#if !defined(RADIO_SX1276)
+    const bool confirmed = result == RADIOLIB_ERR_NONE && _radio.txDone;
+    if (result == RADIOLIB_ERR_NONE && !confirmed) result = RADIOLIB_ERR_TX_TIMEOUT;
+#else
+    const bool confirmed = false; // No newly qualified sibling profile.
+#endif
+    if (confirmed && elapsedMs <= RadioTxPolicy::chargeUs(len) / 1000U) {
+        const uint32_t packetBound = nominalUs + (nominalUs + 99U) / 100U + 2000U;
+        const uint32_t elapsedBound = elapsedMs * 1000U + 1000U;
+        _txPolicy.confirm(packetBound > elapsedBound ? packetBound : elapsedBound);
+        // A failed reduction leaves the larger reservation on flash, never a refund.
+        if (!persistTxBudget()) return RadioTxPolicy::INHIBITED;
+    }
+    if (elapsedMs > RadioTxPolicy::chargeUs(len) / 1000U) {
+        _txReady = false;
+        error("[RADIO] TX timing fault; further TX inhibited, no airtime refund.");
+    }
+    return result;
 }
 
 int16_t Radio::receive(uint8_t data[], size_t len) {
@@ -253,7 +313,7 @@ Radio::Radio() : _radio(new Module(RADIO_NSS, RADIO_IRQ, RADIO_RST, RADIO_GPIO))
 
 void Radio::init(float rxBandwidth, bool lnaBypass) {
     _txReady = false;
-    _txPolicy.reset(millis());
+    const bool budgetReady = loadTxBudget();
 #if defined(RADIO_SX1276)
     SPI.begin(RADIO_SCK, RADIO_MISO, RADIO_MOSI, RADIO_NSS);
 #endif
@@ -292,17 +352,20 @@ void Radio::init(float rxBandwidth, bool lnaBypass) {
         error("[RADIO] Échec initialisation FSK : %d", initResult);
         return;
     }
-    _radio.setFrequency(868.96);
-    _radio.setBitRate(25.0);
-    _radio.setFrequencyDeviation(50.0);
+
     const int16_t bandwidthResult = _radio.setRxBandwidth(rxBandwidth);
     if (bandwidthResult != RADIOLIB_ERR_NONE) {
         error("[RADIO] Échec configuration bande RX %.1f kHz : %d", rxBandwidth, bandwidthResult);
     } else {
         info("[RADIO] Bande RX configurée : %.1f kHz.", rxBandwidth);
     }
-    _radio.setPreambleLength(16);
-    error("[RADIO] TX INHIBITED: HP FEM/antenna ERP mapping unqualified; chip=%d dBm is NOT antenna power. Duty guard=3.6 s/hour incl retries, boot hold=1 hour.", RadioTxPolicy::CHIP_POWER_DBM);
+    const int16_t preambleResult = _radio.setPreambleLength(16);
+#if defined(OFV_HELTEC_V43_LOW_POWER_PROFILE) && defined(WIFI_LORA_32_V4) && defined(USE_KCT8103L_PA) && !defined(RADIO_SX1276)
+    _txReady = budgetReady && bandwidthResult == RADIOLIB_ERR_NONE && preambleResult == RADIOLIB_ERR_NONE
+        && RadioTxPolicy::HELTEC_V43_ENVELOPE_QUALIFIED;
+#endif
+    (void)budgetReady; (void)preambleResult;
+    if (!_txReady) error("[RADIO] TX INHIBITED: missing installed-chain tolerance bound (drive error + pad/mismatch + FEM supply/temperature); nominal net gain is NOT raw FEM gain. Chip=%d dBm, 3.6 s/hour incl 0.5 s no-heat reserve, NVS budget recovery.", RadioTxPolicy::CHIP_POWER_DBM);
 #if defined(RADIO_SX1276)
     info("[RADIO] SX1276 : longueur variable, %u octets max, CRC matériel CCITT.", MAX_RX_PACKET_LENGTH);
 #else

@@ -3,6 +3,7 @@
 #include <Board.h>
 #include <RadioLib.h>
 #include <math.h>
+#include <Preferences.h>
 #include "RadioSettings.h"
 #include "RadioCrc.h"
 #include "RadioTxPolicy.h"
@@ -26,6 +27,8 @@ class Radio {
         int16_t setSyncWord(uint8_t* syncWord, size_t len) { return _radio.setSyncWord(syncWord, len); }
 
     private:
+        bool loadTxBudget();
+        bool persistTxBudget();
         int16_t finishReceive(int16_t result, const char* operation, const uint8_t* data, size_t requestedLength);
         // Les chemins bloquant et asynchrone partagent la lecture et le CRC
         // propres à la puce ; les métadonnées survivent à l'effacement IRQ.
@@ -47,11 +50,13 @@ class Radio {
             int16_t readData(uint8_t* data, size_t len) override;
 #if !defined(RADIO_SX1276)
             int16_t startReceiveWithLimit(uint32_t timeout);
+            int16_t finishTransmit() override;
+            bool txDone = false;
 #endif
         };
         PacketRadio _radio;
         RadioTxPolicy _txPolicy;
-        // No runtime override: HP FEM + antenna ERP mapping remains unqualified.
+        // Exact V4.3 profile only; no runtime power/qualification override.
         bool _txReady = false;
         float _lastPacketRSSI = NAN;
 };

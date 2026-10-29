@@ -1,7 +1,7 @@
 """Real application methods, native service/chip doubles; NOT RF/thermal evidence.
 
 Run all: python3 tests/test_commissioning.py
-Individual causal regressions: pairing, observed, numeric, deadman, rf.
+Native groups cover pairing, observations, parsing, lease and persisted RF admission.
 """
 from pathlib import Path
 import re
@@ -100,21 +100,33 @@ struct MqttManager {
     void command(const char* field,const String& value){handlers.at(String("frisquet/z1/")+field+"/set")(value);}
 };
 struct Preferences {
-    bool begin(const String&,bool){return true;} void end(){}
+    static std::map<std::string,std::vector<byte>> saved;
+    static unsigned writes,failAt;
+    String space;
+    bool begin(const String& name,bool){space=name;return true;} void end(){}
     bool isKey(const char*){return true;}
     float getFloat(const char*,float d=0){return d;}
     uint8_t getUChar(const char*,uint8_t d=0){return d;}
     unsigned getUInt(const char*,unsigned d=0){return d;}
     bool getBool(const char*,bool d=false){return d;}
-    size_t getBytes(const char*,void*,size_t){return 0;}
+    size_t getBytesLength(const char* key){return saved[space+"/"+key].size();}
+    size_t getBytes(const char* key,void* out,size_t n){auto& b=saved[space+"/"+key];if(b.size()!=n)return 0;memcpy(out,b.data(),n);return n;}
     template<class T> void putUChar(const char*,T){}
     template<class T> void putFloat(const char*,T){}
     template<class T> void putUInt(const char*,T){}
     template<class T> void putBool(const char*,T){}
-    size_t putBytes(const char*,void*,size_t n){return n;}
+    size_t putBytes(const char* key,void* in,size_t n){
+        if(space=="ofvRfBudget" && ++writes==failAt)return 0;
+        saved[space+"/"+key]=std::vector<byte>((byte*)in,(byte*)in+n);return n;
+    }
 };
+std::map<std::string,std::vector<byte>> Preferences::saved;
+unsigned Preferences::writes=0,Preferences::failAt=0;
 #define RADIOLIB_ERR_NONE 0
 #define RADIOLIB_ERR_RX_TIMEOUT -6
+#define RADIOLIB_ERR_TX_TIMEOUT -5
+#define RADIOLIB_SX126X_IRQ_TX_DONE 1
+#define RADIOLIB_SX126X_IRQ_TIMEOUT 512
 #define RADIOLIB_ERR_ADDRESS_NOT_FOUND -7
 #define RADIOLIB_ERR_PACKET_TOO_LONG -8
 #define RADIOLIB_SX126X_MAX_PACKET_LENGTH 255
@@ -125,18 +137,38 @@ for name in ('NumericPayload.h', 'ControlLease.h', 'RadioTxPolicy.h'):
     if (ROOT/'src'/name).exists():
         prefix += f'\n#include "{name}"\n'
 prefix += stripped('Frisquet/NetworkID.h')
+driver_path = next((ROOT/'.pio/libdeps').glob('*/RadioLib/src/modules/SX126x/SX126x.cpp'))
+driver_fsk = driver_path.read_text().split('case RADIOLIB_MODEM_FSK: {', 1)[1].split('}', 1)[0]
+prefix += r'''
+uint32_t driverTimeOnAir(size_t len){
+    struct {struct {float bitRate=25.0;} fsk;} dr; // RadioLib FSKRate_t is kbps.
+    struct {struct {uint8_t crcLength=2,syncWordLength=32,preambleLength=16;} fsk;} pc;
+''' + driver_fsk + '}\n'
 prefix += r'''
 struct Config {
     NetworkID network;unsigned saves=0;
     bool useConnect(){return false;} bool useDS18B20(){return false;}
     NetworkID getNetworkID(){return network;} void setNetworkID(NetworkID n){network=n;} void save(){++saves;}
 };
-struct Chip {
+struct SX1262 {
+    uint32_t irq=0;
+    uint32_t getIrqFlags(){return irq;}
+    virtual int16_t finishTransmit(){irq=0;return 0;}
+};
+struct Chip:SX1262 {
     unsigned transmissions=0;int txError=0;
+    bool txDone=false,reportDone=true;unsigned latency=0;int toaError=0;
+    std::function<void()> onTransmit;
     int standby(){return 0;} int setCRC(int,int,int,bool){return 0;}
     int variablePacketLengthMode(size_t){return 0;}
     std::vector<std::vector<byte>> sent;
-    int transmit(byte* data,size_t length){++transmissions;sent.emplace_back(data,data+length);return txError;}
+    uint32_t getTimeOnAir(size_t length){return uint32_t(driverTimeOnAir(length)+toaError);}
+    int16_t finishTransmit() override;
+    int transmit(byte* data,size_t length){
+        if(onTransmit)onTransmit();++transmissions;sent.emplace_back(data,data+length);
+        tick+=latency;irq=reportDone?RADIOLIB_SX126X_IRQ_TX_DONE:RADIOLIB_SX126X_IRQ_TIMEOUT;
+        finishTransmit();return txError;
+    }
 };
 struct Radio {
     static constexpr size_t MAX_RX_PACKET_LENGTH=63;
@@ -155,11 +187,15 @@ struct Radio {
     bool hasReceivedPacket(){return !frames.empty();}
     int readData(byte* b,size_t n){return receive(b,n);}
     int16_t transmit(byte* b,size_t n){return tx?tx(b,n):_radio.transmit(b,n);}
+    bool persistTxBudget();bool loadTxBudget();
 '''
 if (ROOT/'src/RadioTxPolicy.h').exists():
     prefix += 'RadioTxPolicy _txPolicy; bool _txReady=true;\n'
 prefix += '};\n'
 prefix += 'struct TxRadio:Radio { int16_t transmit(byte*,size_t); };\n'
+prefix += extract(source('Radio.cpp'), 'bool Radio::persistTxBudget(')
+prefix += extract(source('Radio.cpp'), 'bool Radio::loadTxBudget(')
+prefix += extract(source('Radio.cpp'), 'int16_t Radio::PacketRadio::finishTransmit(').replace('Radio::PacketRadio::','Chip::')
 prefix += extract(source('Radio.cpp'), 'int16_t Radio::transmit(').replace('Radio::transmit(', 'TxRadio::transmit(')
 prefix += stripped('Frisquet/Utils.h')
 prefix += 'String byteArrayToHexString(uint8_t*,int){return "hex";}\n'
@@ -382,17 +418,15 @@ void rf(){
     r._txReady=false;
     assert(r.transmit(data,sizeof(data))!=0);
     assert(r._radio.transmissions==0); // unqualified HP/antenna mapping cannot transmit
-    r._txReady=true;r._txPolicy.reset(0);tick=RadioTxPolicy::HOUR_MS-1;
-    assert(r.transmit(data,sizeof(data))==RadioTxPolicy::AIRTIME_LIMIT && r._radio.transmissions==0);
-    tick=RadioTxPolicy::HOUR_MS;r._radio.txError=-99;
-    const unsigned permitted=RadioTxPolicy::BUDGET_US/RadioTxPolicy::chargeUs(sizeof(data));
+    r._txReady=true;r._txPolicy.reset(0);tick=100;r._radio.txError=-99;
+    const unsigned permitted=(RadioTxPolicy::BUDGET_US-RadioTxPolicy::SAFETY_RESERVE_US)/RadioTxPolicy::chargeUs(sizeof(data));
     for(unsigned n=0;n<permitted;++n)assert(r.transmit(data,sizeof(data))==-99);
     assert(r.transmit(data,sizeof(data))==RadioTxPolicy::AIRTIME_LIMIT && r._radio.transmissions==permitted);
-    tick+=RadioTxPolicy::HOUR_MS-1;assert(r.transmit(data,sizeof(data))==RadioTxPolicy::AIRTIME_LIMIT);
-    tick+=60001;assert(r.transmit(data,sizeof(data))==-99); // conservative 61st bucket expires
-    TxRadio reboot;reboot._txReady=true;reboot._txPolicy.reset(tick);
+    TxRadio reboot;reboot._txReady=true;assert(reboot.loadTxBudget());
     assert(reboot.transmit(data,sizeof(data))==RadioTxPolicy::AIRTIME_LIMIT);
-    RadioTxPolicy wrap;wrap.reset(UINT32_MAX-1000);assert(!wrap.reserve(UINT32_MAX-1,11));
+    tick+=RadioTxPolicy::HOUR_MS+60000U-1;assert(r.transmit(data,sizeof(data))==RadioTxPolicy::AIRTIME_LIMIT);
+    tick=62*60000U;assert(r.transmit(data,sizeof(data))==-99); // retain the whole packet at minute edges
+    RadioTxPolicy wrap;wrap.reset(UINT32_MAX-1000);assert(wrap.reserve(UINT32_MAX-1,11));
     assert(wrap.reserve(uint32_t(UINT32_MAX-1000+RadioTxPolicy::HOUR_MS),11));
     // Pair confirmations and read retries reach the SAME actual TX seam.
     TxRadio shared;shared._txReady=true;shared._txPolicy.reset(0);tick=RadioTxPolicy::HOUR_MS;
@@ -408,6 +442,120 @@ void rf(){
     shared._txReady=false;length=sizeof(buffer);
     assert(protocol.sendAsk(8,0x80,0x12,1,1,0xA029,0x15,buffer,length,5)==RadioTxPolicy::INHIBITED);
     assert(shared._radio.transmissions==before+5);
+}
+std::vector<byte> noHeat(){
+    return {0x80,8,0x12,1,1,0x17,0xA0,0x29,0,0x15,0xA0,0x2F,0,4,8,1,44,0,50,0,0x10,0,0};
+}
+void bootBudget(){
+    TxRadio r;r._txReady=true;tick=100;r._txPolicy.reset(0);
+    auto safe=noHeat();
+    assert(r.transmit(safe.data(),safe.size())==0); // no unconditional boot RF quarantine
+}
+void safetyReserve(){
+    TxRadio r;r._txReady=true;r._txPolicy.reset(0);tick=RadioTxPolicy::HOUR_MS;
+    byte ordinary[23]={};r._radio.txError=-99;
+    while(r.transmit(ordinary,sizeof(ordinary))==-99){}
+    auto safe=noHeat();const auto spent=r._txPolicy.usedUs();
+    TxRadio reboot;reboot._txReady=true;assert(reboot.loadTxBudget());reboot._radio.txError=-99;
+    const unsigned allowance=(RadioTxPolicy::BUDGET_US-spent)/RadioTxPolicy::chargeUs(safe.size());
+    assert(allowance>=8);
+    for(unsigned n=0;n<allowance;++n)assert(reboot.transmit(safe.data(),safe.size())==-99);
+    assert(reboot.transmit(safe.data(),safe.size())==RadioTxPolicy::AIRTIME_LIMIT);
+    assert(reboot._radio.transmissions==allowance && reboot._txPolicy.usedUs()<=RadioTxPolicy::BUDGET_US);
+    printf("reserve: after ordinary exhaustion and reboot, %u ambiguous no-heat attempts admitted\n",allowance);
+}
+void cadence(){
+    TxRadio accounted;accounted._txReady=true;accounted._txPolicy.reset(0);
+    tick=RadioTxPolicy::HOUR_MS;
+    FrisquetRadio r;Config c;MqttManager m;Zone z(8,m);Chaudiere b;Satellite s(r,c,m,z,b);
+    setup(z);s.begin(true);s.setIdAssociation(0x12);
+    r.tx=[&](byte* data,size_t size){
+        int16_t result=accounted.transmit(data,size);
+        if(result==0){
+            auto response=reply(data[5]);response[3]=data[3];
+            if(data[5]==3 && data[6]==0xA0 && data[7]==0x5E){response.resize(9);response[6]=2;}
+            r.frames.push_back(response);
+        }
+        if(result!=0)printf("cadence TX refused: code=%d length=%zu at=%u\n",result,size,tick);
+        fflush(stdout);return result;
+    };
+    const auto start=tick;
+    for(unsigned minute=0;minute<60;++minute){
+        tick=start+minute*60000U;clockNow+=60;
+        m.command("mode","Confort");m.command("temperatureConsigne","21");m.command("temperatureAmbiante","18");
+        m.command("controlHeartbeat",String("1:")+String(minute+1));
+        const unsigned before=accounted._radio.transmissions;s.loop();
+        assert(!s._initialReadPending && accounted._radio.transmissions>before);
+        if(minute%5==4)assert(s.recupererTemperatureCDC()); // native 2/10-minute CDC cadence
+    }
+    m.online=false;tick=start+3600000U;s.loop();
+    unsigned normal=0,safety=0,reads=0;
+    for(const auto& frame:accounted._radio.sent){
+        if(frame[5]==3)++reads;
+        if(frame.size()!=23)continue;
+        if(RadioTxPolicy::isNoHeat(frame.data(),frame.size()))++safety;
+        else {assert(frame[15]==0 && frame[16]==180 && frame[17]==0 && frame[18]==210);++normal;}
+    }
+    assert(normal==60 && safety==1 && reads>=14);
+    printf("cadence: normal=%u safe=%u reads=%u total=%zu (60 heartbeats, native + 12 extra CDC reads)\n",normal,safety,reads,accounted._radio.sent.size());
+    printf("cadence accounted_us=%u ceiling_us=%u\n",accounted._txPolicy.usedUs(),RadioTxPolicy::BUDGET_US);
+}
+void budgetRecovery(){
+    Preferences::saved.clear();Preferences::writes=0;Preferences::failAt=0;
+    TxRadio legacy;legacy._txReady=true;tick=0;assert(legacy.loadTxBudget());
+    auto safe=noHeat();
+    assert(legacy.transmit(safe.data(),safe.size())==RadioTxPolicy::AIRTIME_LIMIT); // truly unknown legacy spend
+    tick=62*60000U;assert(legacy.transmit(safe.data(),safe.size())==0);
+    const auto confirmed=legacy._txPolicy.usedUs();assert(confirmed<RadioTxPolicy::chargeUs(safe.size()));
+    TxRadio reboot;reboot._txReady=true;tick=1;assert(reboot.loadTxBudget());
+    assert(reboot._txPolicy.usedUs()==confirmed && reboot.transmit(safe.data(),safe.size())==0);
+    const auto before=reboot._txPolicy.usedUs();
+    reboot._radio.onTransmit=[&](){
+        TxRadio interrupted;assert(interrupted.loadTxBudget());
+        assert(interrupted._txPolicy.usedUs()==before+RadioTxPolicy::chargeUs(safe.size()));
+    };
+    reboot._radio.txError=-99;assert(reboot.transmit(safe.data(),safe.size())==-99);
+    reboot._radio.onTransmit=nullptr;
+    TxRadio afterFailure;afterFailure._txReady=true;assert(afterFailure.loadTxBudget());
+    assert(afterFailure._txPolicy.usedUs()==before+RadioTxPolicy::chargeUs(safe.size()));
+    Preferences::failAt=Preferences::writes+1;
+    const unsigned sent=afterFailure._radio.transmissions;
+    assert(afterFailure.transmit(safe.data(),safe.size())==RadioTxPolicy::INHIBITED && afterFailure._radio.transmissions==sent);
+    Preferences::failAt=0;
+    // No success refund without a TX_DONE receipt, even when the driver returns 0.
+    TxRadio ambiguous;ambiguous._txReady=true;ambiguous._txPolicy.reset(0);ambiguous._radio.reportDone=false;
+    assert(ambiguous.transmit(safe.data(),safe.size())==RADIOLIB_ERR_TX_TIMEOUT);
+    assert(ambiguous._txPolicy.usedUs()==RadioTxPolicy::chargeUs(safe.size()));
+    // Failed post-success persistence retains the larger write-ahead amount on flash.
+    TxRadio reduction;reduction._txReady=true;reduction._txPolicy.reset(0);
+    Preferences::failAt=Preferences::writes+2;
+    assert(reduction.transmit(safe.data(),safe.size())==RadioTxPolicy::INHIBITED);
+    Preferences::failAt=0;TxRadio recovered;assert(recovered.loadTxBudget());
+    assert(recovered._txPolicy.usedUs()==RadioTxPolicy::chargeUs(safe.size()));
+    // A bad format/timing estimate or malformed safety payload cannot obtain reserve.
+    TxRadio wrong;wrong._txReady=true;wrong._radio.toaError=1000;
+    assert(wrong.transmit(safe.data(),safe.size())==RadioTxPolicy::INHIBITED && wrong._radio.transmissions==0);
+    assert(RadioTxPolicy::isNoHeat(safe.data(),safe.size()));
+    for(unsigned field=0;field<safe.size();++field){
+        if(field==2 || field==3)continue;
+        auto bad=safe;bad[field]^=1;assert(!RadioTxPolicy::isNoHeat(bad.data(),bad.size()));
+    }
+    auto bad=safe;bad[2]=255;assert(!RadioTxPolicy::isNoHeat(bad.data(),bad.size()));
+    assert(!RadioTxPolicy::isNoHeat(safe.data(),safe.size()-1));
+    // Recovered/corrupt spend never gains credit from wall time or repeated resets.
+    Preferences::saved["ofvRfBudget/used"]={1,2,3};
+    TxRadio corrupt;corrupt._txReady=true;assert(corrupt.loadTxBudget());
+    assert(corrupt._txPolicy.usedUs()==RadioTxPolicy::BUDGET_US);
+    assert(corrupt.transmit(safe.data(),safe.size())==RadioTxPolicy::AIRTIME_LIMIT);
+    TxRadio resetAgain;assert(resetAgain.loadTxBudget());assert(resetAgain._txPolicy.usedUs()==RadioTxPolicy::BUDGET_US);
+    TxRadio wrapped;wrapped._txReady=true;tick=UINT32_MAX-5;wrapped._txPolicy.reset(tick);
+    wrapped._radio.latency=10;assert(wrapped.transmit(safe.data(),safe.size())==0);
+    assert(wrapped._txPolicy.usedUs()==12343);
+    TxRadio late;late._txReady=true;late._radio.latency=58;
+    assert(late.transmit(safe.data(),safe.size())==0 && !late._txReady);
+    assert(late._txPolicy.usedUs()==RadioTxPolicy::chargeUs(safe.size()));
+    assert(late.transmit(safe.data(),safe.size())==RadioTxPolicy::INHIBITED);
+    printf("budget: write-ahead, reset, NVS failure, no ambiguous refund, reserve classifier and units verified\n");
 }
 void recovery(){
     FrisquetRadio r;Config c;FrisquetManager manager(r,c);NetworkID old(9,8,7,6);r.setNetworkID(old);c.network=old;
@@ -425,7 +573,9 @@ void recovery(){
 int main(int argc,char** argv){
     assert(argc==2);std::string c=argv[1];
     if(c=="pairing")pairing();else if(c=="observed")observed();else if(c=="numeric")numeric();
-    else if(c=="deadman")deadman();else if(c=="rf")rf();else if(c=="recovery")recovery();else assert(false);
+    else if(c=="deadman")deadman();else if(c=="rf")rf();else if(c=="recovery")recovery();
+    else if(c=="bootBudget")bootBudget();else if(c=="safetyReserve")safetyReserve();else if(c=="cadence")cadence();
+    else if(c=="budgetRecovery")budgetRecovery();else assert(false);
     printf("PASS %s (real application code, simulated services/radio)\n",argv[1]);
 }
 '''
@@ -436,7 +586,7 @@ with tempfile.TemporaryDirectory(prefix='commissioning-') as directory:
     subprocess.run(['c++','-std=c++11','-g','-fsanitize=address,undefined',
                     '-fno-omit-frame-pointer','-I',str(ROOT/'src'),str(cpp),'-o',str(binary)],check=True)
     failures = []
-    groups = sys.argv[1:] or ['pairing','observed','numeric','deadman','rf','recovery']
+    groups = sys.argv[1:] or ['pairing','observed','numeric','deadman','rf','recovery','bootBudget','safetyReserve','cadence','budgetRecovery']
     for group in groups:
         result = subprocess.run([str(binary),group])
         if result.returncode:

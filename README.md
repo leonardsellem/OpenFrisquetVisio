@@ -2,27 +2,94 @@
 
 ## Candidat de préparation V4.3 — émission interdite
 
-Ce candidat local n'est pas une mise en service. Toutes les émissions passent
-par `Radio::transmit`, qui reste inhibé sans chemin d'activation : la relation
-SX1262 → FEM KCT8103L → antenne/ERP n'est pas qualifiée. La consigne explicite
-−9 dBm est celle de la puce, PAS une puissance à l'antenne. Aucun essai radio
-ou thermique, aucune conformité RF mesurée n'est revendiquée.
+Ce candidat local n'est pas une mise en service. L'unique profil envisagé est
+`heltec_wifi_lora_32_V4_3`, SX1262 à −9 dBm demandés, 868,96 MHz, GFSK 25 kbit/s,
+FEM KCT8103L et antenne 863–928 MHz de gain ≤4 dBi. Les autres cibles ne sont
+pas qualifiées. `HELTEC_V43_ENVELOPE_QUALIFIED` reste faux, sans dérogation runtime :
+le prédicat de tolérance ci-dessous manque encore. Aucun essai RF/thermique,
+aucune réception physique ou conformité mesurée n'est revendiqué.
 
-Le garde global réserve avant chaque tentative (y compris association/retries)
-au plus 3,6 s par heure glissante, via 61 tranches d'une minute. Il surcompte
-le timeout RadioLib (5 ms + 5× temps nominal, arrondi conservateur) et impose
-une heure sans TX après boot pour couvrir le budget antérieur inconnu.
-Ce silence réglementaire peut empêcher un ordre de sécurité après reboot :
-une garantie physique de coupure de chauffe n'est donc PAS livrée par ce build.
+### Puissance : chaîne complète, pas gain FEM brut
+
+Le [schéma officiel V4.3](https://resource.heltec.cn/download/WiFi_LoRa_32_V4/Schematic/HTIT-WB32LAF_V4.3.pdf)
+montre RFO → pad π (59 Ω shunt / 280 Ω série / 59 Ω shunt) → TX **pin 1** du
+KCT8103L ; TX_IN **pin 11** est après le PA. Le pad nominal vaut 21,141248 dB
+en référence 50 Ω. Vfem vient du TLV75733 (nominal 3,3 V). La
+[fiche KCT8103L Rev A](https://resource.heltec.cn/download/HT-RA62A/KCT8103L_DS_REVA_20241010.pdf)
+donne 36 dB de gain petit signal maximum à 3,3 V et **25 °C**, ports adaptés.
+Son tableau de contrôle confirme CSD/CTX/CPS = 1/1/1 en TX, 1/0/X en RX LNA,
+1/1/0 en RX bypass, 0/X/X en shutdown ; PA_CPS vient de DIO2, PA_CTX de GPIO5,
+PA_CSD de GPIO2. Aucune modification de ce chemin matériel n'est nécessaire.
+
+Avec puissance puce nominale et antenne ≤4 dBi, le calcul à 25 °C est :
+`−9 − 21,141248 + 36 + 4 − 2,15 = 7,708752 dBm ERP`.
+Le plafond 25 mW ERP vaut 13,979400 dBm : il reste **6,270648 dB** pour l'erreur
+de puissance réelle de la puce, le pad/son désadaptement et la variation de gain
+FEM avec alimentation/température. C'est le **majorant conjoint** de ces termes
+qui manque, pas une impossibilité matérielle. Le schéma ne spécifie pas la
+tolérance des résistances ; supposer ±5 % donne 20,418532 dB de pad minimal,
+mais reste une hypothèse, pas une propriété prouvée du kit. La table FEM à
+25 °C et un article de portée ne bornent pas ce majorant sur les conditions
+réelles. Une justification primaire de ce majorant suffit à réexaminer le gate ;
+ce constat n'impose ni achat ni mesureur particulier.
+
+L'[article Heltec V4.3](https://wiki.heltec.org/news/how-far-can-heltec-wifi-loRa-32-v4-reach-r2-vs-r8-tested-in-the-real-world/how-far-can-heltec-wifi-loRa-32-v4-reach-r2-vs-r8-tested-in-the-real-world)
+corrobore environ 11 dB de gain **net** à 923,2 MHz/LoRa, pas un maximum garanti
+à 868,96 MHz/GFSK. La [page antennes Heltec](https://heltec.org/project/sma-antenna/)
+donne whip 4 dBi et glue rod 3 dBi ; l'identité de l'antenne installée reste à
+confirmer avant admission. RadioLib appelle déjà `setOutputPower` depuis
+`beginFSK` ; sa table optimisée traduit la demande −9 en paVal −5 / duty 2 /
+hpMax 2. Ni ce registre ni −9 ne constituent une mesure à l'antenne.
+
+### Temps d'antenne et redémarrage
+
+Toutes les tentatives passent par `Radio::transmit`, association et retries inclus.
+Un seul budget de **3 600 000 µs** couvre l'heure glissante. Les 62 tranches
+d'une minute retiennent aussi un paquet chevauchant une frontière : récupération
+conservatrice après 61–62 minutes, jamais créditée par l'horloge civile.
+Les 500 000 µs de réserve non-chauffante sont **dans** ce budget. Le trafic
+ordinaire ne peut pas les dépenser. Seul le payload Z1 exact 30 °C / 5 °C /
+mode brut 0x10 / options nulles y accède ; ni une priorité d'API ni un second
+budget d'association ne permettent de contourner cette règle.
+
+Avant TX, Preferences/NVS `ofvRfBudget/used` engage le timeout complet :
+`6 000 µs + 5 × temps nominal`. RadioLib exprime FSKRate_t en **kbit/s**, le
+préambule en **bits** et `getTimeOnAir` en **µs**. Le code ajoute l'octet de
+longueur que son calcul GFSK omet et vérifie le format effectif. Après TX_DONE
+vérifié **et** retour réussi de standby, seulement, la réservation peut être
+réduite au maximum de (temps nominal + 1 % + 2 ms) et (durée bloquante observée
++ 1 ms). Erreur/IRQ ambiguë : aucun remboursement. Dépassement du timeout
+comptabilisé : aucune réduction et inhibition des émissions suivantes.
+
+Un reboot recharge toute la dépense NVS comme récente, sans la remettre à zéro.
+Après du trafic ordinaire, la réserve reste donc disponible immédiatement,
+même au reboot ; le test admet 8 tentatives Z1 ambiguës après saturation du
+trafic ordinaire. Un ledger absent/corrompu signifie **budget antérieur inconnu** :
+aucune émission pendant la fenêtre de récupération. Ce cas de migration doit
+être traité **avant** association/chauffe, pas présenté comme un repli en marche.
+Une panne NVS empêche un nouvel engagement et donc le TX. Aucun budget fini
+ne peut garantir réception ou coupure en cas de panne radio/stockage répétée.
+
+Le test exécute la boucle Satellite avec 60 heartbeats, 26 lectures (cadence
+native plus 12 lectures CDC supplémentaires) et un repli : 87 tentatives
+réussies simulées, comptées 964 589 µs, sous le plafond ordinaire de 3,1 s.
+Ce n'est ni une mesure de waveform ni une garantie de temps de réponse physique.
 
 Contrôle virtuel, sans changer les topics scalaires existants :
 
-1. Le producteur lit `<baseTopic>/controlSession`, défi renouvelé à chaque
-   connexion MQTT. Le défi n'est ni une identité ni une autorisation.
+1. Base par défaut `frisquet`. Le producteur souscrit `<baseTopic>/controlSession`
+   (état retained, 16 caractères hexadécimaux), renouvelé à chaque connexion
+   MQTT **du firmware**, y compris après boot. Le défi n'est ni une identité
+   ni une autorisation. La disponibilité est
+   `<baseTopic>/openFrisquetVisio/availability` (`online`/`offline`) ; cet état
+   retained n'est pas une preuve de connexion actuelle (pas de Last Will ici).
 2. Toutes les 60 s, il recalcule les données courantes et publie sans retain
    `z1/mode/set`, `z1/temperatureConsigne/set`, `z1/temperatureAmbiante/set`
    (ordre libre), puis `z1/controlHeartbeat/set` = `<défi>:<séquence uint64>`.
-   La séquence doit croître strictement dans cette session. Chaque heartbeat
+   Ces quatre commandes partent sur une même connexion producteur, sans autre
+   writer concurrent, avec le heartbeat **après** les trois scalaires. La
+   séquence est décimale, uint64 sans signe (0..18446744073709551615), et doit
+   croître strictement dans cette session. Chaque heartbeat
    exige les trois commandes valides reçues depuis le heartbeat précédent,
    chacune âgée d'au plus 60 s. Les profils seuls ne qualifient rien.
 3. Le bail expire exactement à 1 800 000 ms depuis le dernier heartbeat accepté,
@@ -30,8 +97,16 @@ Contrôle virtuel, sans changer les topics scalaires existants :
    Boot/restauration NVS, perte MQTT/Wi-Fi, reconnexion et tentative de réassociation
    désarment le contrôle ; il faut de nouvelles données et un nouveau heartbeat.
    Les temps d'origine de réception ne sont jamais restaurés comme « maintenant ».
+   Sur nouveau défi, abandonner l'ancien cycle, vider les commandes en attente,
+   recommencer les trois scalaires puis la séquence de la nouvelle session.
+   Si seul le producteur redémarre et que le défi reste identique, il doit
+   préserver sa séquence croissante : repartir arbitrairement à 1 sera rejeté.
+   Il n'existe pas de topic d'ACK de séquence ; les états scalaires ne sont pas
+   un ACK. `z1/controlSafety` est une éligibilité locale, pas une réception chaudière.
    Ce protocole atteste un producteur actif ; il ne mesure pas l'âge physique
-   du capteur, que le producteur doit qualifier avant de publier.
+   du capteur, que le producteur doit qualifier avant de publier. Un producteur
+   en transition-only ne respecte PAS ce contrat, même si ses topics scalaires
+   étaient compatibles avant le bail. Ce correctif ne migre aucun writer HA/NAS.
 
 Sans bail valide, ou si la chaudière déclare l'arrêt chauffage, le payload est
 fixé à consigne 5 °C / ambiance de contrôle 30 °C / mode Hors Gel (erreur −25 °C).
